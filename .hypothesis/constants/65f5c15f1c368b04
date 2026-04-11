@@ -1,4 +1,0 @@
-# file: C:\Users\syam6\Desktop\Work\AI_Agent\Voice_Order_Status_Agent\backend\order_lookup.py
-# hypothesis_version: 6.151.12
-
-["'", "'delivered'", ',', ', ', 'Customer', 'DATABASE_URL', 'ORDERS_PHONE_COL', 'OrderLookupService', '[^0-9]', '[a-z0-9_\\-]+', 'active_orders', 'active_orders_count', 'app_user_id', 'changed_at', 'created_at', 'customer', 'customer_confirmed', 'customer_not_found', 'd10', 'db_error', 'delivered', 'delivered_at', 'error', 'external_order_id', 'items', 'latest_status', 'limit', 'message', 'missing_input', 'multiple_users', 'name', 'new_status', 'no_active_orders', 'not_configured', 'ok', 'order', 'order_id', 'order_not_found', 'order_number', 'order_ref', 'payment_method', 'payment_status', 'phone_last10', 'postgres://', 'postgresql://', 'price', 'quantity', 'query', 'reason', 'resolve_user_id', 'resolved_user_id', 'resolved_user_name', 'status', 'total_amount', 'user_id', 'warnings']
