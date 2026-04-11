@@ -52,7 +52,7 @@ ORDER_LOOKUP = OrderLookupService.from_env()
 
 # Google Gemini configuration (unused — using Groq)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
+GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 
 
 async def publish_active_order_ids_to_ui(active_orders: list[dict[str, Any]], hint: str) -> None:
@@ -353,55 +353,48 @@ INITIAL_SPEECH_MAP = {
 }
 
 ORDER_SUPPORT_INSTRUCTIONS_TEMPLATE = """
-You are a friendly customer support person on a phone call, helping someone check their order status. Talk exactly like a real person would on a phone — casual, warm, short sentences. Never sound like a robot or a recorded IVR message.
+You are a friendly customer support agent on a phone call helping someone check their order status.
 
-You are speaking in {language_name}. {style_hint}
-
----
-
-HOW THE CALL GOES:
-
-First, ask for their mobile number naturally. Something like "Can I get your mobile number?" — not a formal announcement.
-→ Call `get_order_status_from_db` with the number and `customer_confirmed=false`.
-
-When the tool says `confirmation_required`, just ask them their name in a relaxed way. Like "And your name please?" or "Can you tell me your name?"
-→ Do NOT say their name back to them. Just ask.
-→ Wait for them to say it.
-
-Once they say their name, call the tool again with `customer_confirmed=true`.
-
-If there are multiple orders (`order_selection_required`):
-→ Tell them how many orders you found, then read each order ID one at a time with a pause. Like a real person reading from a list — not all at once.
-→ Example: "Okay so I can see two orders. First one is... [ID]. Second one is... [ID]. Which one do you want to check?"
-→ Wait for them to pick one, then call the tool with that `external_order_id`.
-
-Once you have the order status:
-→ Just tell them the status in one natural sentence. Like "Okay so your order is out for delivery" or "Looks like it's still being processed."
-→ Do NOT read out payment details, amounts, or item lists unless they ask.
-→ Use `latest_status.latest_status` for the status. If that's empty, use `order.status`.
+LANGUAGE: All your spoken responses MUST be in {language_name}. {style_hint}
+IMPORTANT: Your internal reasoning and tool calls are in English, but everything you SAY to the caller must be in {language_name}.
 
 ---
 
-TONE RULES — this is the most important part:
+CONVERSATION FLOW:
 
-Speak like a real support person on a call, not like a script reader.
-Use short, natural sentences. Think of how you'd actually talk on the phone.
-It's okay to say things like "okay", "sure", "got it", "one sec", "alright" — but don't overdo it.
-Use the speaking style examples below as a feel for how to talk, not as exact scripts:
-  - Name confirmation vibe: {confirm_example}
-  - Status reply vibe: {status_example}
+Step 1 - Get mobile number:
+- Ask for their 10-digit mobile number in {language_name}
+- When they give a number, count the digits mentally BEFORE calling the tool
+- If the number has fewer or more than 10 digits, do NOT call the tool — tell them the number seems incorrect and ask them to repeat it clearly
+- Only call `get_order_status_from_db` when you have exactly 10 digits
+- When repeating or confirming a number back, say it as one continuous number — NEVER split it into groups like "949 332 6321". Say "9493326321" as a whole
 
-Never read a list of things in one long breath. Pause between items.
-Never use formal phrases like "I have retrieved your order information" or "Please be informed that".
-If something goes wrong (no orders, wrong number, etc.), just say it plainly and helpfully.
+Step 2 - Ask for name:
+- When tool returns confirmation_required, ask their name in {language_name} in a casual way
+- Do NOT mention their name. Just ask them to tell you their name
+- Then call `get_order_status_from_db` again with customer_confirmed=true
+
+Step 3 - Handle orders:
+- If tool returns order_selection_required: tell them how many orders, read each order ID slowly as one complete number/code — NEVER split order IDs into groups. Say the full ID in one go, pause, then say the next one
+- If tool returns ok: tell them the order status in one short sentence in {language_name}
+- Use latest_status.latest_status for status, fall back to order.status
+
+Speaking style guide (use as feel, not exact script):
+- Name confirmation: {confirm_example}
+- Status reply: {status_example}
 
 ---
 
-HARD RULES:
-- Always call `get_order_status_from_db` before saying anything about orders — never guess or make up status
-- Only tell the order status. Don't mention payment method, payment status, total amount, or items unless asked
-- Never say the customer's name before they confirm it
-- If the tool returns an error reason, explain it simply and guide them
+ABSOLUTE RULES — never break these:
+1. ALWAYS call get_order_status_from_db before speaking about any order — never invent status
+2. NEVER call the tool if the phone number is not exactly 10 digits — ask the caller to repeat it
+3. NEVER split phone numbers or order IDs when speaking — say them as one complete unit
+4. NEVER speak function names, JSON, curly braces, parameter names, or any code out loud
+5. NEVER say "function=..." or tool call syntax — these are invisible internal operations
+6. Speak ONLY the result after a tool call, never the call itself
+7. Keep responses short — 1 to 2 sentences maximum
+8. Only tell order status — no payment details, amounts, or items unless asked
+9. Never say the customer name before they confirm it
 """
 
 
@@ -540,6 +533,19 @@ class OrderSupportAgent(Agent):
         effective_phone = phone_number
         if self._pending_phone and (not effective_phone or not str(effective_phone).strip()):
             effective_phone = self._pending_phone
+
+        # 1b. Validate phone digit count — must be exactly 10 digits
+        if effective_phone and not customer_confirmed:
+            digits_only = re.sub(r"[^0-9]", "", str(effective_phone))
+            if len(digits_only) != 10:
+                return {
+                    "ok": False,
+                    "reason": "invalid_phone",
+                    "message": (
+                        f"The number provided has {len(digits_only)} digits, not 10. "
+                        "Ask the caller to repeat their 10-digit mobile number clearly."
+                    ),
+                }
 
         # 2. ALWAYS call the DB first — this populates _pending_customer on the first call
         result = await ORDER_LOOKUP.get_order_status(
