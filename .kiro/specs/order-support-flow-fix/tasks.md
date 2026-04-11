@@ -1,0 +1,125 @@
+# Implementation Plan
+
+- [ ] 1. Write bug condition exploration tests
+  - **Property 1: Bug Condition** - First-Call DB Lookup and Cross-DB Fallback
+  - **CRITICAL**: These tests MUST FAIL on unfixed code — failure confirms the bugs exist
+  - **DO NOT attempt to fix the tests or the code when they fail**
+  - **NOTE**: These tests encode the expected behavior — they will validate the fix when they pass after implementation
+  - **GOAL**: Surface counterexamples that demonstrate the bugs exist
+  - **Scoped PBT Approach**: Scope to concrete failing cases for reproducibility
+  - Use `hypothesis` library for property-based testing
+  - Create `backend/tests/test_bugfix_exploration.py`
+  - **Test 1.1 — First-call guard fires (Defect 1.1)**:
+    - Mock `ORDER_LOOKUP.get_order_status` to return `{"ok": False, "reason": "confirmation_required", "customer": {"user_id": "u1", "name": "Ravi Kumar"}, "phone_last10": "9876543210"}`
+    - Call `get_order_status_from_db(phone_number="9876543210", customer_confirmed=False)`
+    - Assert `result["customer"] is not None` and `agent._pending_customer is not None`
+    - Run on UNFIXED code — expect FAILURE (guard returns before DB is called, `_pending_customer` stays `None`)
+    - Document counterexample: `_pending_customer` is `None` after first call
+  - **Test 1.2 — Confirmation loop (Defect 1.2)**:
+    - After a first call that fails to set `_pending_customer`, call again with `customer_confirmed=True`
+    - Assert `result["reason"] != "confirmation_required"`
+    - Run on UNFIXED code — expect FAILURE (infinite loop)
+  - **Test 1.3 — Lost phone (Defect 1.3)**:
+    - After a first call, call again with `customer_confirmed=True` and no `phone_number`
+    - Assert `result["reason"] != "missing_input"`
+    - Run on UNFIXED code — expect FAILURE (`_pending_phone` was never set)
+  - **Test 1.4 — Cross-DB empty orders (Defect 1.4)**:
+    - Configure `list_active_orders_for_user` to return `[]` and `list_active_orders_for_user_by_phone` to return one order
+    - Set `_orders_phone_col = "phone"`
+    - Assert `result["reason"] != "no_active_orders"`
+    - Run on UNFIXED code — expect FAILURE (fallback method does not exist yet)
+  - **PBT scope**: Generate random 10-digit phone strings; for each, mock DB to return a customer; assert `_pending_customer is not None` after first call
+  - Run tests on UNFIXED code
+  - **EXPECTED OUTCOME**: Tests FAIL (this is correct — it proves the bugs exist)
+  - Document all counterexamples found to understand root cause
+  - Mark task complete when tests are written, run, and failures are documented
+  - _Requirements: 1.1, 1.2, 1.3, 1.4_
+
+- [ ] 2. Write preservation property tests (BEFORE implementing fix)
+  - **Property 2: Preservation** - Non-Buggy Inputs Produce Identical Results
+  - **IMPORTANT**: Follow observation-first methodology
+  - Use `hypothesis` library for property-based testing
+  - Create `backend/tests/test_preservation.py`
+  - Observe behavior on UNFIXED code for inputs where `isBugCondition_EarlyGuard` is False (i.e., `_pending_customer` is already set) and `isBugCondition_CrossDbMismatch` is False
+  - **Test 2.1 — `customer_not_found` preserved**:
+    - Generate random phone numbers with no DB match
+    - Assert result is `customer_not_found`
+    - Observe on unfixed code: returns `{"ok": False, "reason": "customer_not_found"}`
+  - **Test 2.2 — `multiple_users` preserved**:
+    - Phone matching two users → assert result is `multiple_users`
+  - **Test 2.3 — Single active order preserved**:
+    - `_pending_customer` already set, name matches, one active order → assert `result["ok"] is True`
+  - **Test 2.4 — `no_active_orders` preserved when `ORDERS_PHONE_COL` not set**:
+    - `list_active_orders_for_user` returns `[]`, `_orders_phone_col` is empty → assert `no_active_orders`
+  - **Test 2.5 — `order_selection_required` preserved**:
+    - Confirmed customer with two active orders → assert `order_selection_required`
+  - **Test 2.6 — `order_not_found` preserved**:
+    - `external_order_id` supplied but not matched → assert `order_not_found`
+  - **Test 2.7 — Subsequent confirmed call preserved**:
+    - `_pending_customer` already set, name matches → guard does not fire, DB result returned as-is
+  - **PBT scope**: Generate random `(phone, customer, orders)` triples where `_pending_customer` is already set and name matches; assert fixed and original return the same result
+  - Write property-based tests capturing observed behavior patterns from Preservation Requirements in design
+  - Run tests on UNFIXED code
+  - **EXPECTED OUTCOME**: Tests PASS (this confirms baseline behavior to preserve)
+  - Mark task complete when tests are written, run, and passing on unfixed code
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8_
+
+- [ ] 3. Fix for order support flow — early guard, cross-DB fallback, and null display ID
+
+  - [ ] 3.1 Rewrite `get_order_status_from_db` in `backend/worker.py` (Fixes 1/2/3)
+    - Remove the early `if customer_confirmed:` guard block that fires before the DB call
+    - Move `effective_phone` fallback to apply unconditionally (not only when `customer_confirmed=True`): `if self._pending_phone and (not effective_phone or not str(effective_phone).strip()): effective_phone = self._pending_phone`
+    - Always call `ORDER_LOOKUP.get_order_status(phone_number=effective_phone, customer_confirmed=customer_confirmed, external_order_id=external_order_id)` as the first substantive statement
+    - Store `_pending_phone` and `_pending_customer` from the DB result BEFORE any guard check or return
+    - Move the name-confirmation guard to AFTER the DB call: only fire when `customer_confirmed=True` AND `result.get("reason") == "confirmation_required"` AND `not picking_order`
+    - Move `publish_active_order_ids_to_ui` call to after the post-DB guard
+    - _Bug_Condition: isBugCondition_EarlyGuard — call._pending_customer IS NULL AND call.customer_confirmed = false_
+    - _Expected_Behavior: result["reason"] = "confirmation_required", result["customer"] IS NOT NULL, agent._pending_customer IS NOT NULL, agent._pending_phone = normalize(phone_number)_
+    - _Preservation: All inputs where _pending_customer is already set, customer_confirmed=True with passing name check, external_order_id selection step — must produce identical results_
+    - _Requirements: 2.1, 2.2, 2.3_
+
+  - [ ] 3.2 Add `list_active_orders_for_user_by_phone` method to `OrderLookupService` in `backend/order_lookup.py` (Fix 4 — part A)
+    - Add new async method `list_active_orders_for_user_by_phone(self, phone_number: str, *, limit: int = 50) -> list[dict[str, Any]]`
+    - Return `[]` immediately if `self._orders_phone_col` is empty or `d10` is empty
+    - Query `transactions.orders` filtering by `RIGHT(REGEXP_REPLACE(COALESCE(o.{self._orders_phone_col}::text, ''), '[^0-9]', '', 'g'), 10) = :d10` with active status filter (same excluded statuses as `list_active_orders_for_user`)
+    - Select same columns as `list_active_orders_for_user`
+    - _Bug_Condition: isBugCondition_CrossDbMismatch — farmer_engagement_user_id ≠ vikrayasetu_user_id AND ORDERS_PHONE_COL IS NOT NULL_
+    - _Requirements: 2.4_
+
+  - [ ] 3.3 Add cross-DB phone fallback in `get_order_status` in `backend/order_lookup.py` (Fix 4 — part B)
+    - After `list_active_orders_for_user` returns empty and before the `no_active_orders` return, add: if `not active_orders and self._orders_phone_col`, try `list_active_orders_for_user_by_phone(cleaned_phone, limit=50)` and assign result to `active_orders` (swallow exceptions)
+    - Fallback is skipped when `_orders_phone_col` is empty (preserves single-DB deployments)
+    - _Bug_Condition: isBugCondition_CrossDbMismatch_
+    - _Expected_Behavior: result is NOT no_active_orders when phone-based fallback returns orders_
+    - _Preservation: no_active_orders still returned when ORDERS_PHONE_COL not set and list_active_orders_for_user returns []_
+    - _Requirements: 2.4, 3.4_
+
+  - [ ] 3.4 Fix null display ID in `order_for_caller` in `backend/order_lookup.py` (Fix 5)
+    - Change `"external_order_id": eid or None` to `"external_order_id": eid if eid else str(row.get("order_id", ""))`
+    - This ensures `external_order_id` is never `None` in the caller-facing dict
+    - _Bug_Condition: display_order_id_for_ui returns "" (no external_order_number, order_number, or order_id)_
+    - _Expected_Behavior: external_order_id is always a non-None string_
+    - _Requirements: 2.5_
+
+  - [ ] 3.5 Verify bug condition exploration tests now pass
+    - **Property 1: Expected Behavior** - First-Call DB Lookup and Cross-DB Fallback
+    - **IMPORTANT**: Re-run the SAME tests from task 1 — do NOT write new tests
+    - The tests from task 1 encode the expected behavior
+    - When these tests pass, it confirms the expected behavior is satisfied
+    - Run `backend/tests/test_bugfix_exploration.py` on FIXED code
+    - **EXPECTED OUTCOME**: All tests PASS (confirms all 5 defects are fixed)
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
+
+  - [ ] 3.6 Verify preservation tests still pass
+    - **Property 2: Preservation** - Non-Buggy Inputs Unchanged
+    - **IMPORTANT**: Re-run the SAME tests from task 2 — do NOT write new tests
+    - Run `backend/tests/test_preservation.py` on FIXED code
+    - **EXPECTED OUTCOME**: Tests PASS (confirms no regressions)
+    - Confirm all preservation scenarios still pass after fix
+
+- [ ] 4. Checkpoint — Ensure all tests pass
+  - Run the full test suite: `python -m pytest backend/tests/ -v`
+  - Ensure all exploration tests pass (bug is fixed)
+  - Ensure all preservation tests pass (no regressions)
+  - Verify `order_for_caller` never returns `None` for `external_order_id` (Property 4)
+  - Ask the user if any questions arise before closing the spec

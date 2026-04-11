@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+livekit
+livekit-agents
+livekit-plugins-silero
+livekit-plugins-openai
+livekit-plugins-google
+livekit-plugins-groq
+sqlalchemy
+asyncpg
