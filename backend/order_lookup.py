@@ -185,23 +185,19 @@ class OrderLookupService:
         d10 = self.normalize_phone(phone_number)
         if not d10:
             return []
+        print(f"[DB] Looking up phone last 10 digits: {d10}")
         query = """
             SELECT u.user_id::text AS resolved_user_id
                  , COALESCE(
-                       NULLIF(
-                           BTRIM(
-                               CONCAT_WS(
-                                   ' ',
-                                   NULLIF(BTRIM(u.first_name::text), ''),
-                                   NULLIF(BTRIM(u.last_name::text), '')
-                               )
-                           ),
-                           ''
-                       ),
+                       NULLIF(BTRIM(CONCAT_WS(' ',
+                           NULLIF(BTRIM(u.first_name::text), ''),
+                           NULLIF(BTRIM(u.last_name::text), '')
+                       )), ''),
                        NULLIF(BTRIM(u.first_name::text), ''),
                        NULLIF(BTRIM(u.last_name::text), ''),
                        'Customer'
                    ) AS resolved_user_name
+                 , u.phone::text AS db_phone
             FROM master.users AS u
             WHERE RIGHT(
                 REGEXP_REPLACE(COALESCE(u.phone::text, ''), '[^0-9]', '', 'g'),
@@ -212,6 +208,10 @@ class OrderLookupService:
             LIMIT 2
         """
         rows = await self._fetch_all(self._farmer_engine, query, {"d10": d10})
+        print(f"[DB] Found {len(rows)} users for phone {d10}")
+        if rows:
+            for row in rows:
+                print(f"[DB] User: {row.get('resolved_user_name')}, DB phone: {row.get('db_phone')}")
         return [
             {
                 "user_id": str(row["resolved_user_id"]),

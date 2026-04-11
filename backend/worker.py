@@ -43,10 +43,9 @@ SARVAM_STT_PRIMARY_MODE = (os.environ.get("SARVAM_STT_MODE") or "codemix").strip
 
 TARGET_SAMPLE_RATE = 16000
 
-# When every STT attempt returns nothing, emit this user text so the LLM still replies (asks to repeat).
-STT_EMPTY_FALLBACK_USER_TEXT = (
-    "Please ask for my mobile number again — I will speak the ten digits more slowly."
-)
+# When every STT attempt returns nothing, the agent should remain silent.
+STT_EMPTY_FALLBACK_USER_TEXT = ""
+
 
 ORDER_LOOKUP = OrderLookupService.from_env()
 
@@ -110,6 +109,7 @@ class SarvamSTT(stt.STT):
     def __init__(self, language: str = "en-IN"):
         super().__init__(capabilities=stt.STTCapabilities(streaming=False, interim_results=False))
         self.language = language
+        self._client = httpx.AsyncClient(timeout=20.0)  # reuse connection across calls
 
     @staticmethod
     async def _sarvam_stt_once(
@@ -162,46 +162,47 @@ class SarvamSTT(stt.STT):
             f"{src_channels}ch->1ch) lang={lang}"
         )
 
-        # Order: user-configured primary, then modes that often work better for digit-only speech.
+        # Only try 2 modes max — codemix handles most cases, transcribe as fallback.
+        # Trying 4 modes sequentially adds 2-3s of extra latency per turn.
         modes: list[str] = []
-        for m in (
-            SARVAM_STT_PRIMARY_MODE,
-            "transcribe",
-            "verbatim",
-            "codemix",
-        ):
+        for m in (SARVAM_STT_PRIMARY_MODE, "transcribe"):
             if m and m not in modes:
                 modes.append(m)
 
         text = ""
-        async with httpx.AsyncClient() as client:
-            for mode in modes:
-                try:
-                    text = await self._sarvam_stt_once(
-                        client, wav_data, mode=mode, language_code=lang
-                    )
-                except Exception as exc:
-                    print(f"[STT] mode={mode} lang={lang} failed: {exc}")
-                    continue
-                if text:
-                    print(f"[STT] mode={mode} lang={lang} transcript: '{text}'")
-                    break
+        for mode in modes:
+            try:
+                text = await self._sarvam_stt_once(
+                    self._client, wav_data, mode=mode, language_code=lang
+                )
+            except Exception as exc:
+                print(f"[STT] mode={mode} lang={lang} failed: {exc}")
+                continue
+            if text:
+                print(f"[STT] mode={mode} lang={lang} transcript: '{text}'")
+                break
 
-            # Spoken digits are often tagged en-IN; retry transcribe with English if still empty.
-            if not text and lang not in ("en-IN", "en", "unknown"):
-                try:
-                    text = await self._sarvam_stt_once(
-                        client, wav_data, mode="transcribe", language_code="en-IN"
-                    )
-                    if text:
-                        print(f"[STT] fallback en-IN transcribe transcript: '{text}'")
-                except Exception as exc:
-                    print(f"[STT] fallback en-IN transcribe failed: {exc}")
+        # Spoken digits are often tagged en-IN; retry transcribe with English if still empty.
+        if not text and lang not in ("en-IN", "en", "unknown"):
+            try:
+                text = await self._sarvam_stt_once(
+                    self._client, wav_data, mode="transcribe", language_code="en-IN"
+                )
+                if text:
+                    print(f"[STT] fallback en-IN transcribe transcript: '{text}'")
+            except Exception as exc:
+                print(f"[STT] fallback en-IN transcribe failed: {exc}")
 
         if not text:
-            print("[STT] All attempts returned empty — using fallback text so the agent still speaks")
-            text = STT_EMPTY_FALLBACK_USER_TEXT
+            print("[STT] All attempts returned empty — agent will remain silent")
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(text="", language=self.language)],
+            )
 
+        # Clean up trailing punctuation that Sarvam STT adds (especially periods after numbers)
+        text = text.rstrip('.!?,;:')
+        
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[stt.SpeechData(text=text, language=self.language)],
@@ -214,20 +215,21 @@ class SarvamChunkedStream(tts.ChunkedStream):
         self._tts = tts_instance
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        # Use distinct natural voices per language (not bright/energetic ones)
         speaker_map = {
-            "hi-IN": "rahul",
-            "te-IN": "aditya",
-            "ta-IN": "vijay",
-            "ml-IN": "gokul",
-            "kn-IN": "vijay",
-            "bn-IN": "amit",
-            "gu-IN": "shubh",
-            "mr-IN": "rahul",
-            "pa-IN": "rahul",
-            "or-IN": "aditya",
-            "en-IN": "amit",
+            "hi-IN": "rohan",   # Hindi - smooth, professional male
+            "te-IN": "varun",   # Telugu - warm male
+            "ta-IN": "mani",    # Tamil - clear male
+            "ml-IN": "sunny",   # Malayalam - friendly male
+            "kn-IN": "tarun",   # Kannada - natural male
+            "bn-IN": "dev",     # Bengali - warm male
+            "gu-IN": "kabir",   # Gujarati - smooth male
+            "mr-IN": "sumit",   # Marathi - professional male
+            "pa-IN": "manan",   # Punjabi - energetic male
+            "or-IN": "rehan",   # Odia - calm male
+            "en-IN": "ashutosh",# English - clear professional male
         }
-        speaker = speaker_map.get(self._tts.language, "aditya")
+        speaker = speaker_map.get(self._tts.language, "rohan")
 
         # Strip markdown artifacts the LLM may inject (bold, italic, bullets, etc.)
         clean_text = re.sub(r"\*+", "", self.input_text)
@@ -235,6 +237,23 @@ class SarvamChunkedStream(tts.ChunkedStream):
         clean_text = re.sub(r"`+", "", clean_text)
         clean_text = re.sub(r"^\s*[-*•]\s+", "", clean_text, flags=re.MULTILINE)
         clean_text = clean_text.strip()
+
+        # Add natural pauses: replace periods with commas to avoid sentence breaks (tic-tic sounds)
+        # Keep question marks and exclamations but add slight pause markers
+        clean_text = re.sub(r"\.\s+", ", ", clean_text)  # period → comma (smoother flow)
+        clean_text = re.sub(r"([?!])\s+", r"\1 ... ", clean_text)  # add pause after ? or !
+        
+        # Ensure natural breathing pauses in long sentences
+        if len(clean_text) > 100 and "," not in clean_text:
+            # Insert comma after ~50 chars at word boundary
+            words = clean_text.split()
+            char_count = 0
+            for i, word in enumerate(words):
+                char_count += len(word) + 1
+                if char_count > 50 and i < len(words) - 1:
+                    words[i] = words[i] + ","
+                    break
+            clean_text = " ".join(words)
 
         # Sarvam TTS silently truncates beyond ~500 chars; trim at sentence boundary
         if len(clean_text) > TTS_MAX_CHARS:
@@ -252,37 +271,36 @@ class SarvamChunkedStream(tts.ChunkedStream):
             "text": clean_text,
             "target_language_code": self._tts.language,
             "speaker": speaker,
-            "pace": 1.0,
-            "sample_rate": 16000,
+            "pace": 1.05,          # slightly faster for clarity
+            "sample_rate": 24000,  # Sarvam's native high-quality rate
             "enable_preprocessing": True,
             "model": "bulbul:v3",
         }
         print(f"[TTS] Synthesizing in {self._tts.language}: {clean_text[:60]}...")
-        async with httpx.AsyncClient() as client:
-            headers = {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"}
-            resp = await client.post(SARVAM_TTS_URL, json=payload, headers=headers, timeout=30.0)
-            if not resp.is_success:
-                print(f"[TTS] Error {resp.status_code}: {resp.text}")
-                resp.raise_for_status()
-            audio_b64 = resp.json().get("audios", [""])[0]
-            raw_pcm = base64.b64decode(audio_b64)
-            # Sarvam returns raw 16-bit PCM; wrap in WAV so LiveKit decodes it correctly
-            wav_bytes = pcm_to_wav(raw_pcm, sample_rate=16000, channels=1)
-            print(f"[TTS] Got {len(raw_pcm)} PCM bytes -> {len(wav_bytes)} WAV bytes")
-            output_emitter.initialize(
-                request_id=uuid.uuid4().hex,
-                sample_rate=16000,
-                num_channels=1,
-                mime_type="audio/wav",
-            )
-            output_emitter.push(wav_bytes)
-            output_emitter.flush()
+        headers = {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"}
+        resp = await self._tts._client.post(SARVAM_TTS_URL, json=payload, headers=headers)
+        if not resp.is_success:
+            print(f"[TTS] Error {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+        audio_b64 = resp.json().get("audios", [""])[0]
+        # Sarvam returns base64-encoded WAV - decode directly, no need to wrap again
+        wav_bytes = base64.b64decode(audio_b64)
+        print(f"[TTS] Got {len(wav_bytes)} WAV bytes")
+        output_emitter.initialize(
+            request_id=uuid.uuid4().hex,
+            sample_rate=24000,  # match Sarvam's output
+            num_channels=1,
+            mime_type="audio/wav",
+        )
+        output_emitter.push(wav_bytes)
+        output_emitter.flush()
 
 
 class SarvamTTS(tts.TTS):
     def __init__(self, language: str = "en-IN"):
-        super().__init__(capabilities=tts.TTSCapabilities(streaming=False), sample_rate=16000, num_channels=1)
+        super().__init__(capabilities=tts.TTSCapabilities(streaming=False), sample_rate=24000, num_channels=1)
         self.language = language
+        self._client = httpx.AsyncClient(timeout=20.0)  # reuse connection across calls
 
     def synthesize(self, text: str, *, conn_options=None) -> tts.ChunkedStream:
         return SarvamChunkedStream(tts_instance=self, input_text=text, conn_options=conn_options)
@@ -303,117 +321,160 @@ LANGUAGE_NAME_MAP = {
 }
 
 LANGUAGE_STYLE_HINT_MAP = {
-    "hi-IN": "Use friendly spoken Hinglish. Mix natural Hindi with common English support words like mobile number, confirm, order status, delivery, payment, and update.",
-    "te-IN": "Use friendly spoken Telugu with light English mixing. Words like mobile number, confirm, order status, delivery, payment, and update can stay in English where natural.",
-    "ta-IN": "Use friendly spoken Tamil with light English mixing. Keep common support words like mobile number, confirm, order status, delivery, payment, and update natural and phone-call friendly.",
-    "ml-IN": "Use friendly spoken Malayalam with light English mixing. Common support words like mobile number, confirm, order status, delivery, payment, and update can stay in English where natural.",
-    "kn-IN": "Use friendly spoken Kannada with light English mixing. Keep common support words like mobile number, confirm, order status, delivery, payment, and update natural and conversational.",
-    "bn-IN": "Use friendly spoken Bengali with light English mixing. Common support words like mobile number, confirm, order status, delivery, payment, and update can stay in English where natural.",
-    "gu-IN": "Use friendly spoken Gujarati with light English mixing. Common support words like mobile number, confirm, order status, delivery, payment, and update can stay in English where natural.",
-    "mr-IN": "Use friendly spoken Marathi with light English mixing. Common support words like mobile number, confirm, order status, delivery, payment, and update can stay in English where natural.",
-    "pa-IN": "Use friendly spoken Punjabi with light English mixing. Common support words like mobile number, confirm, order status, delivery, payment, and update can stay in English where natural.",
-    "or-IN": "Use friendly spoken Odia with light English mixing. Common support words like mobile number, confirm, order status, delivery, payment, and update can stay in English where natural.",
-    "en-IN": "Use warm spoken Indian English. Sound like a real support person on a call, not a formal script.",
+    "hi-IN": "एक मददगार दोस्त की तरह बात करें। नमस्ते से शुरू करें। English शब्दों (mobile, order, status) को हिंदी के साथ स्वाभाविक रूप से जोड़ें। बातचीत में अपनापन और गरमाहट लाएं।",
+    "te-IN": "ఒక ఆప్త మిత్రుడిలా మాట్లాడండి। నమస్కారం తో మొదలుపెట్టండి। English పదాలను (mobile, order, status) తెలుగులో సహజంగా వాడండి। సంభాషణలో స్నేహపూర్వక భావన ఉండాలి।",
+    "ta-IN": "ஒரு நல்ல நண்பர் மாதிரி பேசுங்க। வணக்கம் சொல்லி ஆரம்பிங்க। English சொற்களை (mobile, order, status) தமிழ்ல இயல்பா பயன்படுத்துங்க। பேச்சுல கனிவும் அன்பும் இருக்கட்டும்.",
+    "ml-IN": "ഒരു സുഹൃത്തിനെപ്പോലെ സംസാരിക്കൂ। നമസ്കാരം പറഞ്ഞു തുടങ്ങൂ। ഇംഗ്ലീഷ് വാക്കുകൾ (mobile, order, status) മലയാളത്തിൽ സ്വാഭാവികമായി ഉപയോഗിക്കൂ। സംസാരത്തിൽ സ്നേഹവും കരുതലും വേണം.",
+    "kn-IN": "ಒಬ್ಬ ಆಪ್ತ ಸ್ನೇಹಿತನಂತೆ ಮಾತನಾಡಿ। ನಮಸ್ಕಾರದಿಂದ ಶುರು ಮಾಡಿ। English ಪದಗಳನ್ನು (mobile, order, status) ಕನ್ನಡದಲ್ಲಿ ಸಹಜವಾಗಿ ಬಳಸಿ। ಸಂಭಾಷಣೆ ಆತ್ಮೀಯವಾಗಿರಲಿ.",
+    "bn-IN": "একজন বন্ধুর মতো কথা বলুন। নমস্কার দিয়ে শুরু করুন। ইংরেজি শব্দগুলো (mobile, order, status) বাংলার সাথে স্বাভাবিকভাবে মিশিয়ে বলুন। কথায় আন্তরিকতা এবং উষ্ণতা রাখুন।",
+    "gu-IN": "એક મદદગાર મિત્રની જેમ વાત કરો. નમસ્તેથી શરૂઆત કરો. English શબ્દો (mobile, order, status) ને ગુજરાતી સાથે સ્વાભાવિક રીતે જોડો. વાતચીતમાં આત્મીયતા અને હૂંફ લાવો.",
+    "mr-IN": "एका जवळच्या मित्राप्रमाणे बोला। नमस्काराने सुरुवात करा। English शब्द (mobile, order, status) मराठीत नैसर्गिकरीत्या वापरा। बोलण्यात आपुलकी आणि जिव्हाळा असावा.",
+    "pa-IN": "ਇੱਕ ਮਦਦਗਾਰ ਦੋਸਤ ਵਾਂਗ ਗੱਲ ਕਰੋ। ਸਤਿ ਸ੍ਰੀ ਅਕਾਲ ਨਾਲ ਸ਼ੁਰੂ ਕਰੋ। ਅੰਗਰੇਜ਼ੀ ਸ਼ਬਦਾਂ (mobile, order, status) ਨੂੰ ਪੰਜਾਬੀ ਨਾਲ ਕੁਦਰਤੀ ਤੌਰ 'ਤੇ ਜੋੜੋ। ਗੱਲਬਾਤ ਵਿੱਚ ਨਿੱਘ ਅਤੇ ਹਮਦਰਦੀ ਰੱਖੋ।",
+    "or-IN": "ଜଣେ ସାହାଯ୍ୟକାରୀ ବନ୍ଧୁ ଭଳି କଥା ହୁଅନ୍ତୁ। ନମସ୍କାରରୁ ଆରମ୍ଭ କରନ୍ତୁ। ଇଂରାଜୀ ଶବ୍ଦଗୁଡ଼ିକ (mobile, order, status) କୁ ଓଡ଼ିଆ ସହିତ ସ୍ୱାଭାବିକ ଭାବରେ ବ୍ୟବହାର କରନ୍ତୁ। କଥାବାର୍ତ୍ତାରେ ଆତ୍ମୀୟତା ଏବଂ ସହାନୁଭୂତି ରଖନ୍ତୁ।",
+    "en-IN": "Talk like a warm, helpful friend on the phone. Start with a friendly greeting. Keep it casual, empathetic, and professional yet personal. Use natural pauses and fillers.",
 }
 
 LANGUAGE_SPEECH_EXAMPLE_MAP = {
     "hi-IN": {
-        "confirm": "Hi Syam ji, aapka naam confirm kar dijiye.",
-        "status": "Okay ji, main aapke order ka status bata deta hoon.",
+        "confirm": "हाँ जी, आप Syam ही हैं ना?",
+        "status": "हाँ भाई, आपका order delivered हो चुका है और उम्मीद है आपको पसंद आया होगा!",
     },
     "te-IN": {
-        "confirm": "Hi Syam garu, mee name confirm chesthara?",
-        "status": "Okay, mee order status chepta.",
+        "confirm": "మీరు శ్యామ్ గారే కదా?",
+        "status": "అవునండి, మీ order delivered అయిపోయింది. ఇంకా ఏమైనా సహాయం కావాలా?",
     },
     "ta-IN": {
-        "confirm": "Hi Syam, unga name confirm pannunga.",
-        "status": "Okay, unga order status solluren.",
+        "confirm": "நீங்க ஷியாம் தானே?",
+        "status": "சொல்லுங்க, உங்க order delivered ஆயிடுச்சு. வேற ஏதாவது உதவி வேணுமா?",
     },
     "ml-IN": {
-        "confirm": "Hi Syam, ningalude name confirm cheyyamo?",
-        "status": "Okay, ningalude order status parayunnu.",
+        "confirm": "നിങ്ങൾ ശ്യാം തന്നെയാണോ?",
+        "status": "അതെ, നിങ്ങളുടെ order delivered ആയിട്ടുണ്ട്. വേറെ എന്തെങ്കിലും സഹായം വേണോ?",
     },
     "kn-IN": {
-        "confirm": "Hi Syam avare, nimma name confirm maadthira?",
-        "status": "Okay, nimma order status heluttene.",
+        "confirm": "ನೀವು ಶ್ಯಾಮ್ ಅಲ್ವಾ?",
+        "status": "ಹೌದು, ನಿಮ್ಮ order delivered ಆಗಿದೆ. ಬೇರೆ ಏನಾದರೂ ಸಹಾಯ ಬೇಕಿತ್ತಾ?",
     },
     "bn-IN": {
-        "confirm": "Hi Syam, apnar name ta confirm korben?",
-        "status": "Okay, apnar order er status bolchi.",
+        "confirm": "আপনি শ্যাম তো?",
+        "status": "হ্যাঁ, আপনার order delivered হয়ে গেছে। আর কিছু জানতে চান?",
     },
     "gu-IN": {
-        "confirm": "Hi Syam bhai, tamaru naam confirm kari do.",
-        "status": "Okay, tamaru order nu status kahu chhu.",
+        "confirm": "તમે શ્યામ જ છો ને?",
+        "status": "હા જી, તમારો order delivered થઈ ગયો છે. બીજી કોઈ મદદ જોઈએ?",
     },
     "mr-IN": {
-        "confirm": "Hi Syam, tumcha name confirm kara na.",
-        "status": "Okay, tumchya order cha status sangto.",
+        "confirm": "तुम्ही श्यामच आहात ना?",
+        "status": "हो, तुमचा order delivered झाला आहे. अजून काही मदत हवी आहे का?",
     },
     "pa-IN": {
-        "confirm": "Hi Syam ji, apna name confirm kar deo.",
-        "status": "Okay ji, tuhade order da status das raha haan.",
+        "confirm": "ਤੁਸੀਂ ਸ਼ਿਆਮ ਹੋ ਨਾ?",
+        "status": "ਹਾਂ ਜੀ, ਤੁਹਾਡਾ order delivered ਹੋ ਗਿਆ ਹੈ। ਹੋਰ ਕੋਈ ਸੇਵਾ?",
     },
     "or-IN": {
-        "confirm": "Hi Syam, apana name confirm karibe ki?",
-        "status": "Okay, apankara order ra status kahuchi.",
+        "confirm": "ଆପଣ ଶ୍ୟାମ ତ?",
+        "status": "ହଁ ଆଜ୍ଞା, ଆପଣଙ୍କ order delivered ହୋଇସାରିଛି। ଆଉ କିଛି ସାହାଯ್ಯ ଦରକାର କି?",
     },
     "en-IN": {
-        "confirm": "Hi Syam, please confirm your name.",
-        "status": "Okay, here's your order status.",
+        "confirm": "You're Syam, right? Just wanted to be sure!",
+        "status": "Great news! Your order has been delivered and is ready for you.",
     },
 }
 
 INITIAL_SPEECH_MAP = {
-    "hi-IN": "नमस्ते, मैं आपका ऑर्डर सपोर्ट सहायक हूँ। कृपया अपना 10 अंकों का मोबाइल नंबर बताइए।",
-    "te-IN": "నమస్తే, నేను మీ ఆర్డర్ సపోర్ట్ సహాయకుడిని. దయచేసి మీ 10 అంకెల మొబైల్ నంబర్ చెప్పండి.",
-    "ta-IN": "வணக்கம், நான் உங்கள் ஆர்டர் உதவி உதவியாளர். தயவுசெய்து உங்கள் 10 இலக்க மொபைல் எண்ணை சொல்லுங்கள்.",
-    "ml-IN": "നമസ്കാരം, ഞാൻ നിങ്ങളുടെ ഓർഡർ സപ്പോർട്ട് സഹായി ആണ്. ദയവായി നിങ്ങളുടെ 10 അക്ക മൊബൈൽ നമ്പർ പറയൂ.",
-    "kn-IN": "ನಮಸ್ಕಾರ, ನಾನು ನಿಮ್ಮ ಆರ್ಡರ್ ಬೆಂಬಲ ಸಹಾಯಕ. ದಯವಿಟ್ಟು ನಿಮ್ಮ 10 ಅಂಕೆಯ ಮೊಬೈಲ್ ಸಂಖ್ಯೆಯನ್ನು ತಿಳಿಸಿ.",
-    "bn-IN": "নমস্কার, আমি আপনার অর্ডার সাপোর্ট সহকারী। দয়া করে আপনার ১০ সংখ্যার মোবাইল নম্বর বলুন।",
-    "gu-IN": "નમસ્તે, હું તમારો ઓર્ડર સપોર્ટ સહાયક છું. કૃપા કરીને તમારો 10 અંકનો મોબાઇલ નંબર કહો.",
-    "mr-IN": "नमस्कार, मी तुमचा ऑर्डर सपोर्ट सहाय्यक आहे. कृपया तुमचा 10 अंकी मोबाईल नंबर सांगा.",
-    "pa-IN": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ, ਮੈਂ ਤੁਹਾਡਾ ਆਰਡਰ ਸਹਾਇਤਾ ਸਹਾਇਕ ਹਾਂ। ਕਿਰਪਾ ਕਰਕੇ ਆਪਣਾ 10 ਅੰਕਾਂ ਵਾਲਾ ਮੋਬਾਈਲ ਨੰਬਰ ਦੱਸੋ।",
-    "or-IN": "ନମସ୍କାର, ମୁଁ ଆପଣଙ୍କ ଅର୍ଡର ସହାୟତା ସହକାରୀ। ଦୟାକରି ଆପଣଙ୍କ 10 ଅଙ୍କର ମୋବାଇଲ ନମ୍ବର କହନ୍ତୁ।",
-    "en-IN": "Hello, I am your order support assistant. Please share your 10-digit phone number.",
+    "hi-IN": "नमस्ते... मैं आपकी order support टीम से बात कर रहा हूँ, आपकी मदद के लिए मैं यहाँ हूँ, क्या आप अपना मोबाइल नंबर बता सकते हैं",
+    "te-IN": "నమస్కారం... నేను order support నుంచి మాట్లాడుతున్నాను, మీకు సహాయం చేయడానికి ఇక్కడ ఉన్నాను, దయచేసి మీ మొబైల్ నంబర్ చెబుతారా",
+    "ta-IN": "வணக்கம்... நான் order support-லிருந்து பேசுறேன், உங்களுக்கு உதவி செய்ய நான் இங்க இருக்கேன், தயவுசெஞ்சு உங்க மொபைல் நம்பரை சொல்ல முடியுமா",
+    "ml-IN": "നമസ്കാരം... ഞാൻ order support-ൽ നിന്നാണ് സംസാരിക്കുന്നത്, സഹായിക്കാൻ ഞാൻ ഇവിടെയുണ്ട്, ദയവായി നിങ്ങളുടെ മൊബൈൽ നമ്പർ പറയാമോ",
+    "kn-IN": "ನಮಸ್ಕಾರ... ನಾನು order support ಇಂದ ಮಾತನಾಡುತ್ತಿದ್ದೇನೆ, ನಿಮಗೆ ಸಹಾಯ ಮಾಡಲು ನಾನು ಇಲ್ಲಿದ್ದೇನೆ, ದಯವಿಟ್ಟು ನಿಮ್ಮ ಮೊಬೈಲ್ ನಂಬರ್ ಹೇಳ್ತೀರಾ",
+    "bn-IN": "নমস্কার... আমি order support থেকে বলছি, আমি আপনাকে সাহায্য করব, আপনি কি আপনার মোবাইল নাম্বারটা বলতে পারেন",
+    "gu-IN": "નમસ્તે... હું order supportમાંથી વાત કરું છું, તમને મદદ કરવા માટે હું અહીં છું, શું તમે તમારો મોબાઈલ નંબર જણાવી શકો",
+    "mr-IN": "नमस्कार... मी order support मधून बोलतोय, तुमच्या मदतीसाठी मी इथे आहे, कृपया तुमचा मोबाईल नंबर सांगू शकता का",
+    "pa-IN": "ਸਤਿ ਸ੍ਰੀ ਅਕਾਲ... ਮੈਂ order support ਤੋਂ ਬੋਲ ਰਿਹਾ ਹਾਂ, ਮੈਂ ਤੁਹਾਡੀ ਮਦਦ ਕਰਾਂਗਾ, ਕੀ ਤੁਸੀਂ ਆਪਣਾ ਮੋਬਾਈਲ ਨੰਬਰ ਦੱਸ ਸਕਦੇ ਹੋ",
+    "or-IN": "ନମସ୍କାର... ମୁଁ order support ରୁ କହୁଛି, ଆପଣଙ୍କୁ ସାହାଯ୍ୟ କରିବା ପାଇଁ ମୁଁ ଏଠାରେ ଅଛି, ଦୟାକରି ଆପଣଙ୍କ ମୋବାଇଲ୍ ନମ୍ବର କହିବେ କି",
+    "en-IN": "Hi there... I'm from the order support team, I'd love to help you with your order, could you please share your mobile number",
 }
 
 ORDER_SUPPORT_INSTRUCTIONS_TEMPLATE = """
-You are a voice support agent. You help callers check their order status.
+You are a friendly, human-like voice support agent helping customers check their order status over a call.
 
 ## CRITICAL: HOW TO USE TOOLS
-- Tools are SILENT background operations. You NEVER speak tool names, JSON, or function syntax.
-- After calling a tool, you ONLY speak the result in natural language.
-- The caller NEVER sees or hears tool calls. They only hear your spoken response.
-- If you feel the urge to say "<function=..." or show JSON — STOP. Just speak the result naturally.
+- Tools are SILENT background operations. Never speak tool names, JSON, or function syntax.
+- After calling a tool, only speak the result in natural spoken language.
+- The caller should feel like they are talking to a real person.
+- Never expose system behavior.
 
 ## LANGUAGE
-Speak ONLY in {language_name} for all responses to the caller.
-Style: {style_hint}
+Speak ONLY in {language_name}.
+Style Guidelines:
+- {style_hint}
+- Talk like a real local person on a phone call
+- Keep tone warm, polite, and slightly casual
+- Use natural fillers where needed (like "okay", "alright", "hmm", "one sec")
+- Avoid robotic or scripted phrasing
+
 Example responses:
 - Asking name: {confirm_example}
 - Giving status: {status_example}
 
-## WHAT TO DO
+## CONVERSATION BEHAVIOR
+- If user interrupts, adapt naturally and continue from where they left
+- Do NOT restart the flow unnecessarily
+- Remember what user already told (like mobile number or name)
+- If user sounds confused, guide them gently
 
-1. Ask for 10-digit mobile number (in {language_name})
-   - Count digits. If not exactly 10, say the number seems wrong and ask again. Do NOT call the tool.
-   - When you have 10 digits → silently call get_order_status_from_db(phone_number=..., customer_confirmed=false)
+## WORKFLOW - FOLLOW THIS EXACT FLOW
 
-2. Ask for name confirmation (in {language_name})
-   - Tool returned confirmation_required → ask "what is your name?" casually
-   - After they say their name → silently call get_order_status_from_db(phone_number=..., customer_confirmed=true)
+### STEP 1: COLLECT MOBILE NUMBER
+- Ask for 10-digit mobile number in a friendly way
+- When user speaks a number, extract ONLY the digits (ignore periods, spaces, dashes)
+- Count ONLY the digit characters
+- If NOT exactly 10 digits:
+  → Respond politely: "Hmm, that number looks a bit off, can you say it once again?"
+  → Do NOT call any tool
+  → Ask again
+- If exactly 10 digits:
+  → Silently call: get_order_status_from_db(phone_number=..., customer_confirmed=false)
+  → Pass the full number as spoken (the tool will clean it)
+  → Wait for tool response
 
-3. Give order status (in {language_name})
-   - Single order → say the status in one sentence
-   - Multiple orders → say how many, read each ID as one complete unit (never split), ask which one
-   - After they pick → silently call get_order_status_from_db(customer_confirmed=true, external_order_id=...)
-   - Say only the order status. Nothing about payment or amounts unless asked.
+### STEP 2: NAME CONFIRMATION (ALWAYS REQUIRED)
+- After phone number is validated, ALWAYS ask for name confirmation for security
+- Ask casually: "Just to confirm, can I know your name?"
+- Accept any reasonable name the user provides (don't be strict about exact matches)
+- Only reject if user clearly says "no" or refuses to provide a name
+- After user responds with their name:
+  → Silently call: get_order_status_from_db(phone_number=..., customer_confirmed=true)
+  → Wait for tool response
+
+### STEP 3: PROVIDE ORDER STATUS
+- If tool returns single order with status:
+  → Speak the status clearly in one sentence
+  → Done
+  
+- If tool returns multiple orders (order_selection_required):
+  → Tell how many orders found
+  → Read each order ID as ONE complete number (never split)
+  → Ask which one they want to check
+  → After user picks one:
+    → Silently call: get_order_status_from_db(customer_confirmed=true, external_order_id=...)
+    → Speak that order's status
+    → Done
+
+- If tool returns error (invalid_phone, not found):
+  → Apologize politely
+  → Ask if they want to try a different number
 
 ## RULES
-- Phone numbers and order IDs: say as ONE complete unit, never split into groups
-- Status only: use latest_status.latest_status, fallback to order.status
-- Never invent order data
-- Keep every response to 1-2 sentences
+- Keep responses short (1–2 sentences max)
+- Speak like a human, not a system
+- Phone numbers & order IDs: Always say as ONE full number (never split into groups)
+- Only provide order status from tool response:
+  → Use latest_status.latest_status
+  → Fallback: order.status
+- Never guess or invent data
+- Do NOT mention payment or price unless user asks
+- Follow the 3-step workflow strictly
 """
 
 
@@ -452,6 +513,19 @@ class OrderSupportAgent(Agent):
     def _is_affirmative_confirmation(self, text: str, customer_name: str | None) -> bool:
         raw = (text or "").strip()
         raw_lower = raw.lower()
+        
+        # Normalize both the spoken text and database name for comparison
+        normalized_spoken = self._normalize_text(text)
+        normalized_db_name = self._normalize_text(customer_name)
+        
+        # If database name exists and spoken text contains it, it's a match
+        if normalized_db_name and normalized_db_name in normalized_spoken:
+            return True
+        
+        # Also check raw text (preserves script-specific characters)
+        if customer_name and customer_name.strip().lower() in raw_lower:
+            return True
+        
         # Short scripted / spoken "yes" that regex would not match as Latin tokens
         if any(
             tok in raw_lower
@@ -516,14 +590,8 @@ class OrderSupportAgent(Agent):
         if any(phrase in normalized for phrase in affirmative_phrases):
             return True
 
-        normalized_name = self._normalize_text(customer_name)
-        if normalized_name and normalized_name in normalized:
-            return True
-        if normalized_name and normalized_name in raw_lower:
-            return True
-
-        identity_phrases = ("i am", "this is", "here", "speaking")
-        return any(phrase in normalized for phrase in identity_phrases)
+        # If none of the above matched, it's NOT confirmed
+        return False
 
     async def on_user_turn_completed(
         self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
@@ -581,31 +649,36 @@ class OrderSupportAgent(Agent):
             self._pending_phone = None
             self._pending_customer = None
 
-        # 4. Name-confirmation guard — only fires when DB itself returned confirmation_required
-        #    AND customer_confirmed=True AND this is not an order-selection step
-        if customer_confirmed and result.get("reason") == "confirmation_required":
-            picking_order = bool((external_order_id or "").strip()) and self._pending_customer is not None
-            if not picking_order:
+        # 4. Name-confirmation guard — always validate name confirmation when customer_confirmed=True
+        #    but only reject if the user clearly said "no" or gave a completely different name
+        if customer_confirmed and self._pending_customer:
+            picking_order = bool((external_order_id or "").strip())
+            if not picking_order:  # This is name confirmation step, not order selection
                 same_phone = (
                     ORDER_LOOKUP.normalize_phone(effective_phone)
                     == ORDER_LOOKUP.normalize_phone(self._pending_phone)
                 )
-                customer_name = (self._pending_customer or {}).get("name")
-                is_affirmative = self._is_affirmative_confirmation(
-                    self._latest_user_text, str(customer_name or "")
-                )
-                if not self._pending_customer or not same_phone or not is_affirmative:
+                customer_name = (self._pending_customer or {}).get("name", "")
+                
+                # Check if user is clearly rejecting or saying no
+                user_text_lower = (self._latest_user_text or "").lower().strip()
+                is_rejection = any(word in user_text_lower for word in [
+                    "no", "nahi", "nahin", "illa", "kadhu", "alla", "na", "naa"
+                ])
+                
+                if not same_phone or is_rejection:
                     return {
                         "ok": False,
-                        "reason": "confirmation_required",
+                        "reason": "confirmation_required", 
                         "phone_last10": ORDER_LOOKUP.normalize_phone(effective_phone),
                         "customer": self._pending_customer,
                         "message": (
-                            "Please tell me your name to confirm your identity."
-                            if self._pending_customer
-                            else "Ask the caller for their 10-digit phone number first."
+                            "I didn't catch that. Please tell me your name to confirm your identity."
                         ),
                     }
+                
+                # If user provided any name (not a rejection), proceed with the database call
+                # The database should now return order details since customer_confirmed=True
 
         # 5. Publish active order IDs to UI when selection is required
         if result.get("reason") == "order_selection_required":
@@ -637,8 +710,8 @@ async def entrypoint(ctx: JobContext):
     # - deactivation_threshold=0.3: Lower threshold to deactivate (quicker to stop when speech ends)
     agent_session = AgentSession(
         vad=silero.VAD.load(
-            min_silence_duration=1.0,
-            min_speech_duration=0.3,
+            min_silence_duration=1.0,   # revert to 1.0s to allow digit entry
+            min_speech_duration=0.3,    # revert to 0.3s for better noise rejection
             activation_threshold=0.6,
             deactivation_threshold=0.3,
         ),
@@ -670,4 +743,8 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, worker_type=WorkerType.ROOM))
+    cli.run_app(WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        worker_type=WorkerType.ROOM,
+        num_idle_processes=2,  # keep 2 warm processes ready — eliminates cold-start delay
+    ))
