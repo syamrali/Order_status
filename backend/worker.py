@@ -643,7 +643,7 @@ async def entrypoint(ctx: JobContext):
             deactivation_threshold=0.3,
         ),
         stt=SarvamSTT(language=lang),
-        llm=openai.LLM.with_groq(
+        llm=groq.LLM(
             model=GROQ_MODEL,
             api_key=GROQ_API_KEY,
         ),
