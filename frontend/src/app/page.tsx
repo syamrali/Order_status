@@ -297,7 +297,12 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
             </div>
           )}
           <div className="participant-meta">
-            Agents: {remoteAgents.map((p) => p.identity).join(", ") || "Waiting..."}
+            Agents:{" "}
+            {remoteAgents.length > 0
+              ? remoteAgents.map((p) => p.identity).join(", ")
+              : agentState
+                ? `Connecting (${agentState})`
+                : "Waiting for agent..."}
           </div>
         </div>
       </div>
