@@ -54,6 +54,9 @@ ORDER_LOOKUP = OrderLookupService.from_env()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 
+# Sarvam TTS has a ~500 char limit per request; longer text gets cut off silently.
+TTS_MAX_CHARS = 450
+
 
 async def publish_active_order_ids_to_ui(active_orders: list[dict[str, Any]], hint: str) -> None:
     """Push active-order rows to the web client via LiveKit data (chat panel)."""
@@ -225,8 +228,28 @@ class SarvamChunkedStream(tts.ChunkedStream):
             "en-IN": "amit",
         }
         speaker = speaker_map.get(self._tts.language, "aditya")
+
+        # Strip markdown artifacts the LLM may inject (bold, italic, bullets, etc.)
+        clean_text = re.sub(r"\*+", "", self.input_text)
+        clean_text = re.sub(r"_{1,2}(.+?)_{1,2}", r"\1", clean_text)
+        clean_text = re.sub(r"`+", "", clean_text)
+        clean_text = re.sub(r"^\s*[-*•]\s+", "", clean_text, flags=re.MULTILINE)
+        clean_text = clean_text.strip()
+
+        # Sarvam TTS silently truncates beyond ~500 chars; trim at sentence boundary
+        if len(clean_text) > TTS_MAX_CHARS:
+            truncated = clean_text[:TTS_MAX_CHARS]
+            last_break = max(
+                truncated.rfind("।"),  # Devanagari danda
+                truncated.rfind("。"),
+                truncated.rfind(". "),
+                truncated.rfind("? "),
+                truncated.rfind("! "),
+            )
+            clean_text = truncated[: last_break + 1].strip() if last_break > 0 else truncated.strip()
+
         payload = {
-            "text": self.input_text,
+            "text": clean_text,
             "target_language_code": self._tts.language,
             "speaker": speaker,
             "pace": 1.0,
@@ -234,7 +257,7 @@ class SarvamChunkedStream(tts.ChunkedStream):
             "enable_preprocessing": True,
             "model": "bulbul:v3",
         }
-        print(f"[TTS] Synthesizing in {self._tts.language}: {self.input_text[:60]}...")
+        print(f"[TTS] Synthesizing in {self._tts.language}: {clean_text[:60]}...")
         async with httpx.AsyncClient() as client:
             headers = {"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"}
             resp = await client.post(SARVAM_TTS_URL, json=payload, headers=headers, timeout=30.0)
@@ -242,15 +265,17 @@ class SarvamChunkedStream(tts.ChunkedStream):
                 print(f"[TTS] Error {resp.status_code}: {resp.text}")
                 resp.raise_for_status()
             audio_b64 = resp.json().get("audios", [""])[0]
-            audio_bytes = base64.b64decode(audio_b64)
-            print(f"[TTS] Got {len(audio_bytes)} audio bytes")
+            raw_pcm = base64.b64decode(audio_b64)
+            # Sarvam returns raw 16-bit PCM; wrap in WAV so LiveKit decodes it correctly
+            wav_bytes = pcm_to_wav(raw_pcm, sample_rate=16000, channels=1)
+            print(f"[TTS] Got {len(raw_pcm)} PCM bytes -> {len(wav_bytes)} WAV bytes")
             output_emitter.initialize(
                 request_id=uuid.uuid4().hex,
                 sample_rate=16000,
                 num_channels=1,
                 mime_type="audio/wav",
             )
-            output_emitter.push(audio_bytes)
+            output_emitter.push(wav_bytes)
             output_emitter.flush()
 
 

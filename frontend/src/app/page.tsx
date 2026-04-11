@@ -136,6 +136,11 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
   const remoteAgents = participants.filter((p) => !p.isLocal);
   const isConnected = roomState === ConnectionState.Connected;
   const isAgentSpeaking = agentState === "speaking";
+
+  // Debug: log room state changes
+  useEffect(() => {
+    console.log("[Room] connectionState:", roomState, "| agentState:", agentState, "| remoteAgents:", remoteAgents.length);
+  }, [roomState, agentState, remoteAgents.length]);
   const micStatus = lastMicrophoneError
     ? "Microphone access failed"
     : !microphoneTrack
@@ -318,7 +323,7 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
                 ? isAgentSpeaking
                   ? "Speaking..."
                   : "Listening..."
-                : "Connecting to call..."}
+                : `Room: ${roomState}...`}
             </div>
 
             <BarVisualizer
