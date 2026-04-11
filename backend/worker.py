@@ -338,22 +338,32 @@ LANGUAGE_SPEECH_EXAMPLE_MAP = {
     "hi-IN": {
         "confirm": "हाँ जी, आप Syam ही हैं ना?",
         "status": "हाँ भाई, आपका order delivered हो चुका है और उम्मीद है आपको पसंद आया होगा!",
+        "name_confirmed": "धन्यवाद! नाम confirm हो गया। यहाँ आपके order की details हैं:",
+        "name_mismatch": "माफ़ करिए, यह नाम हमारे records से match नहीं कर रहा। कृपया सही नाम बताइए।",
     },
     "te-IN": {
         "confirm": "మీరు శ్యామ్ గారే కదా?",
         "status": "అవునండి, మీ order delivered అయిపోయింది. ఇంకా ఏమైనా సహాయం కావాలా?",
+        "name_confirmed": "ధన్యవాదాలు! పేరు confirm అయ్యింది. ఇవి మీ order details:",
+        "name_mismatch": "క్షమించండి, ఈ పేరు మా records లో లేదు. దయచేసి సరైన పేరు చెప్పండి।",
     },
     "ta-IN": {
         "confirm": "நீங்க ஷியாம் தானே?",
         "status": "சொல்லுங்க, உங்க order delivered ஆயிடுச்சு. வேற ஏதாவது உதவி வேணுமா?",
+        "name_confirmed": "நன்றி! பேர் confirm ஆயிடுச்சு. இதுங்க உங்க order details:",
+        "name_mismatch": "மன்னிச்சுங்க, இந்த பேர் எங்க records-ல இல்ல. சரியான பேர சொல்லுங்க।",
     },
     "ml-IN": {
         "confirm": "നിങ്ങൾ ശ്യാം തന്നെയാണോ?",
         "status": "അതെ, നിങ്ങളുടെ order delivered ആയിട്ടുണ്ട്. വേറെ എന്തെങ്കിലും സഹായം വേണോ?",
+        "name_confirmed": "നന്ദി! പേര് confirm ആയി. ഇതാ നിങ്ങളുടെ order details:",
+        "name_mismatch": "ക്ഷമിക്കണം, ഈ പേര് ഞങ്ങളുടെ records ൽ ഇല്ല. ശരിയായ പേര് പറയൂ।",
     },
     "kn-IN": {
         "confirm": "ನೀವು ಶ್ಯಾಮ್ ಅಲ್ವಾ?",
         "status": "ಹೌದು, ನಿಮ್ಮ order delivered ಆಗಿದೆ. ಬೇರೆ ಏನಾದರೂ ಸಹಾಯ ಬೇಕಿತ್ತಾ?",
+        "name_confirmed": "ಧನ್ಯವಾದಗಳು! ಹೆಸರು confirm ಆಯಿತು. ಇವು ನಿಮ್ಮ order details:",
+        "name_mismatch": "ಕ್ಷಮಿಸಿ, ಈ ಹೆಸರು ನಮ್ಮ records ನಲ್ಲಿ ಇಲ್ಲ. ಸರಿಯಾದ ಹೆಸರು ಹೇಳಿ।",
     },
     "bn-IN": {
         "confirm": "আপনি শ্যাম তো?",
@@ -378,6 +388,8 @@ LANGUAGE_SPEECH_EXAMPLE_MAP = {
     "en-IN": {
         "confirm": "You're Syam, right? Just wanted to be sure!",
         "status": "Great news! Your order has been delivered and is ready for you.",
+        "name_confirmed": "Thank you! Name confirmed. Here are your order details:",
+        "name_mismatch": "Sorry, that name doesn't match our records. Please provide the correct name.",
     },
 }
 
@@ -416,6 +428,8 @@ Style Guidelines:
 Example responses:
 - Asking name: {confirm_example}
 - Giving status: {status_example}
+- Name confirmed: {name_confirmed_example}
+- Name mismatch: {name_mismatch_example}
 
 ## CONVERSATION BEHAVIOR
 - If user interrupts, adapt naturally and continue from where they left
@@ -438,16 +452,27 @@ Example responses:
   → Pass the full number as spoken (the tool will clean it)
   → Wait for tool response
 
-### STEP 2: NAME CONFIRMATION (ALWAYS REQUIRED)
+### STEP 2: NAME CONFIRMATION (STRICT VALIDATION REQUIRED)
 - After phone number is validated, ALWAYS ask for name confirmation for security
 - Ask casually: "Just to confirm, can I know your name?"
-- Accept any reasonable name the user provides (don't be strict about exact matches)
-- Only reject if user clearly says "no" or refuses to provide a name
-- After user responds with their name:
+- When user provides their name, validate it against database records:
+  → If name matches: Say "Thank you, name confirmed!" or similar positive confirmation
+  → If name doesn't match: Say "The name doesn't match our records, please provide the correct name"
+- Only proceed to orders after successful name validation
+- After successful name confirmation:
   → Silently call: get_order_status_from_db(phone_number=..., customer_confirmed=true)
   → Wait for tool response
 
 ### STEP 3: PROVIDE ORDER STATUS
+- If tool returns name_mismatch:
+  → Tell user the name doesn't match records
+  → Ask them to provide the correct name again
+  → Do NOT proceed to orders
+
+- If tool returns success with name_confirmed=True:
+  → First say the confirmation_message (e.g., "Thank you! Name confirmed.")
+  → Then provide order details
+
 - If tool returns single order with status:
   → Speak the status clearly in one sentence
   → Done
@@ -491,6 +516,8 @@ def build_order_support_instructions(language_code: str) -> str:
         style_hint=style_hint,
         confirm_example=examples["confirm"],
         status_example=examples["status"],
+        name_confirmed_example=examples.get("name_confirmed", examples["confirm"]),
+        name_mismatch_example=examples.get("name_mismatch", "Sorry, that name doesn't match our records."),
     )
 
 
@@ -509,6 +536,56 @@ class OrderSupportAgent(Agent):
         s = (value or "").lower()
         s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
         return re.sub(r"\s+", " ", s).strip()
+
+    def _is_name_match(self, spoken_text: str, db_name: str) -> bool:
+        """
+        Strict name matching - checks if spoken name matches database name.
+        Handles various formats: first name only, last name only, or full name.
+        """
+        if not spoken_text or not db_name:
+            return False
+            
+        # Normalize both names for comparison
+        spoken_normalized = self._normalize_text(spoken_text)
+        db_normalized = self._normalize_text(db_name)
+        
+        if not spoken_normalized or not db_normalized:
+            return False
+        
+        # If database name is just "Customer", accept any reasonable name
+        if db_normalized == "customer":
+            return len(spoken_normalized) > 1  # Any name with more than 1 character
+        
+        # Split database name into parts (first_name + last_name)
+        db_parts = [part.strip() for part in db_normalized.split() if part.strip()]
+        spoken_parts = [part.strip() for part in spoken_normalized.split() if part.strip()]
+        
+        if not db_parts or not spoken_parts:
+            return False
+        
+        # Check various matching scenarios:
+        # 1. Exact full name match
+        if spoken_normalized == db_normalized:
+            return True
+        
+        # 2. Spoken name contains all database name parts (as complete words)
+        if all(any(part == spoken_word for spoken_word in spoken_parts) for part in db_parts):
+            return True
+        
+        # 3. Database name contains all spoken name parts (as complete words)
+        if all(any(part == db_word for db_word in db_parts) for part in spoken_parts):
+            return True
+        
+        # 4. First name exact match (if user only says first name)
+        if len(spoken_parts) == 1 and len(db_parts) > 0 and spoken_parts[0] == db_parts[0]:
+            return True
+        
+        # 5. Last name exact match (if user only says last name)
+        if len(spoken_parts) == 1 and len(db_parts) > 1 and spoken_parts[0] == db_parts[-1]:
+            return True
+        
+        # No match found
+        return False
 
     def _is_affirmative_confirmation(self, text: str, customer_name: str | None) -> bool:
         raw = (text or "").strip()
@@ -649,8 +726,7 @@ class OrderSupportAgent(Agent):
             self._pending_phone = None
             self._pending_customer = None
 
-        # 4. Name-confirmation guard — always validate name confirmation when customer_confirmed=True
-        #    but only reject if the user clearly said "no" or gave a completely different name
+        # 4. Name-confirmation guard — strict name validation when customer_confirmed=True
         if customer_confirmed and self._pending_customer:
             picking_order = bool((external_order_id or "").strip())
             if not picking_order:  # This is name confirmation step, not order selection
@@ -660,25 +736,39 @@ class OrderSupportAgent(Agent):
                 )
                 customer_name = (self._pending_customer or {}).get("name", "")
                 
-                # Check if user is clearly rejecting or saying no
-                user_text_lower = (self._latest_user_text or "").lower().strip()
-                is_rejection = any(word in user_text_lower for word in [
-                    "no", "nahi", "nahin", "illa", "kadhu", "alla", "na", "naa"
-                ])
+                # Strict name matching - check if spoken name matches database name
+                is_name_match = self._is_name_match(self._latest_user_text, customer_name)
                 
-                if not same_phone or is_rejection:
+                if not same_phone or not is_name_match:
                     return {
                         "ok": False,
-                        "reason": "confirmation_required", 
+                        "reason": "name_mismatch", 
                         "phone_last10": ORDER_LOOKUP.normalize_phone(effective_phone),
                         "customer": self._pending_customer,
                         "message": (
-                            "I didn't catch that. Please tell me your name to confirm your identity."
+                            "The name you provided doesn't match our records. Please provide the correct name associated with this phone number."
                         ),
                     }
                 
-                # If user provided any name (not a rejection), proceed with the database call
-                # The database should now return order details since customer_confirmed=True
+                # Name matches - add success message to result if database returned orders
+                if result.get("ok"):
+                    print(f"[Worker] Name confirmed: {customer_name}")
+                    # Add name confirmation success message to the result
+                    result["name_confirmed"] = True
+                    result["confirmation_message"] = f"Thank you! Name confirmed. Here are your order details:"
+                    return result
+                else:
+                    # Database didn't return orders yet, but name is confirmed - retry the call
+                    print(f"[Worker] Name confirmed: {customer_name}, retrying database call")
+                    retry_result = await ORDER_LOOKUP.get_order_status(
+                        phone_number=effective_phone,
+                        customer_confirmed=True,
+                        external_order_id=external_order_id,
+                    )
+                    if retry_result.get("ok"):
+                        retry_result["name_confirmed"] = True
+                        retry_result["confirmation_message"] = f"Thank you! Name confirmed. Here are your order details:"
+                    return retry_result
 
         # 5. Publish active order IDs to UI when selection is required
         if result.get("reason") == "order_selection_required":
