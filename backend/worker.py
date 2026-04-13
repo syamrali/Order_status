@@ -34,6 +34,9 @@ from order_lookup import OrderLookupService
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
+if not SARVAM_API_KEY:
+    raise ValueError("SARVAM_API_KEY environment variable is required but not set!")
+
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 
@@ -836,5 +839,5 @@ if __name__ == "__main__":
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         worker_type=WorkerType.ROOM,
-        num_idle_processes=2,  # keep 2 warm processes ready — eliminates cold-start delay
+        num_idle_processes=4,  # Increased from 2 to 4 for better capacity
     ))
