@@ -52,6 +52,14 @@ STT_EMPTY_FALLBACK_USER_TEXT = ""
 
 ORDER_LOOKUP = OrderLookupService.from_env()
 
+# Pre-load VAD model once at startup — avoids reloading per session (saves RAM + time)
+_VAD_MODEL = silero.VAD.load(
+    min_silence_duration=1.0,
+    min_speech_duration=0.3,
+    activation_threshold=0.6,
+    deactivation_threshold=0.3,
+)
+
 # Google Gemini configuration (unused — using Groq)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
@@ -802,12 +810,7 @@ async def entrypoint(ctx: JobContext):
     # - activation_threshold=0.6: Higher threshold to activate (more confident it's actual speech, not noise)
     # - deactivation_threshold=0.3: Lower threshold to deactivate (quicker to stop when speech ends)
     agent_session = AgentSession(
-        vad=silero.VAD.load(
-            min_silence_duration=1.0,   # revert to 1.0s to allow digit entry
-            min_speech_duration=0.3,    # revert to 0.3s for better noise rejection
-            activation_threshold=0.6,
-            deactivation_threshold=0.3,
-        ),
+        vad=_VAD_MODEL,
         stt=SarvamSTT(language=lang),
         llm=groq.LLM(
             model=GROQ_MODEL,
@@ -839,5 +842,5 @@ if __name__ == "__main__":
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         worker_type=WorkerType.ROOM,
-        num_idle_processes=4,  # Increased from 2 to 4 for better capacity
+        num_idle_processes=1,  # Render has limited RAM — 1 warm process is enough
     ))
