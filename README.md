@@ -4,7 +4,8 @@ This is a real-time voice customer support agent for order status queries.
 
 It keeps the same voice stack:
 - Sarvam STT (`saaras:v3`)
-- Groq OpenAI-compatible LLM endpoint (`llama-3.3-70b-versatile`)
+- Google Gemini via LiveKit plugin (primary)
+- Groq OpenAI-compatible endpoint (optional fallback)
 - Sarvam TTS (`bulbul:v3`)
 - LiveKit for real-time voice sessions
 
@@ -16,16 +17,32 @@ It keeps the same voice stack:
 4. Backend resolves **name** and **user_id** from `master.users` (last 10 digits of phone) in the farmer-engagement DB.
 5. Agent asks the caller to **confirm their name** (still `customer_confirmed=false` until they answer).
 6. After verbal confirmation, the tool is called again with `customer_confirmed=true`. Orders are loaded **by `user_id`** from `transactions.orders` — only **active** orders (non-delivered by default).
-7. **One active order:** status and items are returned; the agent speaks them. The tool prefers **external_order_id** (from `external_order_number`); if that column is empty, **order_number** or **order_id** is used so the flow never returns blank IDs.
-8. **Several active orders:** the UI lists those same display IDs (external when present). The caller picks one; the agent passes it as `external_order_id` (lookup accepts external number, order number, or order id).
+7. **One active order:** status and items are returned; the agent speaks them. The caller-facing ID is always **external order id** (`external_order_number`, then `external_order_id` if needed).
+8. **Several active orders:** the UI lists those same external IDs. The caller picks one; the agent passes it as `external_order_id`.
 9. LLM answers only from DB tool output (no invented statuses). Sarvam TTS speaks the reply.
 
 ## Database Lookup Logic
 
 1. Resolve `user_id` and customer name from `master.users` using the normalized last 10 digits of the phone number.
 2. After the caller confirms their name, fetch **active** rows from `transactions.orders` for that `user_id` (status not in `ORDER_EXCLUDED_FROM_ACTIVE_STATUSES`, default `delivered`).
-3. **Single active order:** load latest row from `transactions.order_status_history` and line items from `transactions.order_items`. The JSON returned to the agent uses **caller-safe** fields: `external_order_id` maps from `external_order_number`; internal ids are omitted.
-4. **Multiple active orders:** the user chooses by **external_order_number** only; the chat panel shows the same **external_order_id** values.
+3. **Single active order:** load latest row from `transactions.order_status_history` and line items from `transactions.order_items`. The JSON returned to the agent uses **caller-safe** fields only: external order ids are exposed; internal order numbers are not shown to users.
+4. **Multiple active orders:** the user chooses by the same external order id shown in chat.
+
+## Conversation Reliability Guards
+
+- **Name confirmation guard:** backend validates spoken name tokens against DB name (supports short names and common STT/transliteration drift).
+- **Order-ID recovery guard:** if model omits `external_order_id`, backend recovers it from latest speech (including split forms like `439477 PF` -> `439477PF`).
+- **Anti-repeat guard:** backend suppresses duplicate narration for:
+  - already-shared active order list (`order_selection_already_shared`)
+  - already-shared same order status (`order_status_already_shared`)
+  This prevents repeated “same response again” loops.
+
+## UX Notes (Frontend)
+
+- Mic control is manual (starts muted in-call until user unmutes).
+- Chat transcript formatting keeps phone numbers/order IDs unsplit.
+- Connecting filler is shown in selected UI language.
+- A short **voice filler** plays while waiting for first agent reply after connect, and stops immediately when agent speech begins.
 
 ## Required Environment
 
