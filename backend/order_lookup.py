@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -110,23 +111,20 @@ class OrderLookupService:
         return str(ext).strip()
 
     def display_order_id_for_ui(self, row: dict[str, Any]) -> str:
-        """ID to show in chat / read aloud: prefer app external id, else order_number, else short ref."""
-        ext = self._app_external_order_id(row)
-        if ext:
-            return ext
-        on = row.get("order_number")
-        if on is not None and str(on).strip():
-            return str(on).strip()
-        oid = row.get("order_id")
-        if oid is not None and str(oid).strip():
-            return str(oid).strip()
+        """Caller-facing order ID: external identifiers only (never internal order_number)."""
+        ext_num = self._app_external_order_id(row)
+        if ext_num:
+            return ext_num
+        ext_id = row.get("external_order_id")
+        if ext_id is not None and str(ext_id).strip():
+            return str(ext_id).strip()
         return ""
 
     def order_for_caller(self, row: dict[str, Any]) -> dict[str, Any]:
-        """Caller-facing order fields; `external_order_id` uses app id when present, else a display fallback."""
+        """Caller-facing order fields; expose external ID only (no internal order_number)."""
         eid = self.display_order_id_for_ui(row)
         out: dict[str, Any] = {
-            "external_order_id": eid if eid else str(row.get("order_id", "")),
+            "external_order_id": eid,
             "status": _jsonable(row.get("status")),
             "payment_status": _jsonable(row.get("payment_status")),
             "payment_method": _jsonable(row.get("payment_method")),
@@ -228,7 +226,8 @@ class OrderLookupService:
             SELECT
                 o.order_id::text AS order_id,
                 o.order_number::text AS order_number,
-                o.external_order_id::text AS external_order_number,
+                o.external_order_number::text AS external_order_number,
+                o.external_order_id::text AS external_order_id,
                 o.internal_order_id::text AS internal_order_id,
                 o.user_id::text AS user_id,
                 o.status::text AS status,
@@ -263,7 +262,8 @@ class OrderLookupService:
             SELECT
                 o.order_id::text AS order_id,
                 o.order_number::text AS order_number,
-                o.external_order_id::text AS external_order_number,
+                o.external_order_number::text AS external_order_number,
+                o.external_order_id::text AS external_order_id,
                 o.internal_order_id::text AS internal_order_id,
                 o.user_id::text AS user_id,
                 o.status::text AS status,
@@ -300,7 +300,8 @@ class OrderLookupService:
             SELECT
                 o.order_id::text AS order_id,
                 o.order_number::text AS order_number,
-                o.external_order_id::text AS external_order_number,
+                o.external_order_number::text AS external_order_number,
+                o.external_order_id::text AS external_order_id,
                 o.internal_order_id::text AS internal_order_id,
                 o.user_id::text AS user_id,
                 o.status::text AS status,
@@ -335,7 +336,8 @@ class OrderLookupService:
             SELECT
                 o.order_id::text AS order_id,
                 o.order_number::text AS order_number,
-                o.external_order_id::text AS external_order_number,
+                o.external_order_number::text AS external_order_number,
+                o.external_order_id::text AS external_order_id,
                 o.internal_order_id::text AS internal_order_id,
                 o.user_id::text AS user_id,
                 o.status::text AS status,
@@ -375,7 +377,8 @@ class OrderLookupService:
             SELECT
                 o.order_id::text AS order_id,
                 o.order_number::text AS order_number,
-                o.external_order_id::text AS external_order_number,
+                o.external_order_number::text AS external_order_number,
+                o.external_order_id::text AS external_order_id,
                 o.internal_order_id::text AS internal_order_id,
                 o.user_id::text AS user_id,
                 o.status::text AS status,
@@ -390,6 +393,7 @@ class OrderLookupService:
               AND (
                     o.order_id::text = BTRIM(:order_ref)
                  OR o.order_number::text = BTRIM(:order_ref)
+                 OR COALESCE(o.external_order_number::text, '') = BTRIM(:order_ref)
                  OR COALESCE(o.external_order_id::text, '') = BTRIM(:order_ref)
                  OR COALESCE(o.internal_order_id::text, '') = BTRIM(:order_ref)
               )
@@ -458,10 +462,22 @@ class OrderLookupService:
 
         resolved_users: list[dict[str, Any]] = []
         resolve_warning: str | None = None
+        t_resolve = time.perf_counter()
         try:
             resolved_users = await self.resolve_users_by_phone(cleaned_phone)
         except Exception as exc:
             resolve_warning = str(exc)
+            return {
+                "ok": False,
+                "reason": "db_error",
+                "phone_last10": cleaned_phone,
+                "message": "Database query failed while resolving customer by phone.",
+                "error": resolve_warning,
+            }
+        print(
+            f"[TIMING] DB resolve_users_by_phone {(time.perf_counter() - t_resolve) * 1000.0:.0f}ms "
+            f"rows={len(resolved_users)} phone_tail=…{cleaned_phone[-4:]}"
+        )
 
         if len(resolved_users) > 1:
             return {
@@ -497,7 +513,12 @@ class OrderLookupService:
         ext_id = (external_order_id or "").strip()
 
         try:
+            t_list = time.perf_counter()
             active_orders = await self.list_active_orders_for_user(user_id, limit=50)
+            print(
+                f"[TIMING] DB list_active_orders_for_user {(time.perf_counter() - t_list) * 1000.0:.0f}ms "
+                f"count={len(active_orders)}"
+            )
         except Exception as exc:
             return {
                 "ok": False,
@@ -531,14 +552,6 @@ class OrderLookupService:
                 }
             selected_order = active_matches[0]
         else:
-            if not active_orders and self._orders_phone_col:
-                try:
-                    active_orders = await self.list_active_orders_for_user_by_phone(
-                        cleaned_phone, limit=50
-                    )
-                except Exception:
-                    pass  # fallback failed; proceed to no_active_orders below
-
             if not active_orders:
                 return {
                     "ok": False,

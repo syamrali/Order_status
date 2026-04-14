@@ -55,6 +55,43 @@ export const SUPPORTED_LANGUAGES = [
   { code: "en-IN", name: "English", label: "English" },
 ];
 
+const CONNECTING_FILLER_BY_LANGUAGE: Record<string, string> = {
+  "hi-IN": "वॉइस एजेंट से कनेक्ट हो रहा है, कृपया प्रतीक्षा करें...",
+  "te-IN": "వాయిస్ ఏజెంట్‌కు కనెక్ట్ అవుతోంది, దయచేసి వేచి ఉండండి...",
+  "ta-IN": "வாய்ஸ் ஏஜென்டுடன் இணைக்கப்படுகிறது, தயவுசெய்து காத்திருக்கவும்...",
+  "ml-IN": "വോയ്‌സ് ഏജന്റുമായി കണക്റ്റ് ചെയ്യുന്നു, ദയവായി കാത്തിരിക്കുക...",
+  "kn-IN": "ವಾಯ್ಸ್ ಏಜೆಂಟ್‌ಗೆ ಸಂಪರ್ಕಿಸಲಾಗುತ್ತಿದೆ, ದಯವಿಟ್ಟು ಕಾಯಿರಿ...",
+  "bn-IN": "ভয়েস এজেন্টের সাথে সংযোগ করা হচ্ছে, অনুগ্রহ করে অপেক্ষা করুন...",
+  "gu-IN": "વૉઇસ એજન્ટ સાથે કનેક્ટ થઈ રહ્યું છે, કૃપા કરીને રાહ જુઓ...",
+  "mr-IN": "व्हॉइस एजंटशी कनेक्ट होत आहे, कृपया थांबा...",
+  "pa-IN": "ਵੋਇਸ ਏਜੰਟ ਨਾਲ ਕਨੈਕਟ ਕੀਤਾ ਜਾ ਰਿਹਾ ਹੈ, ਕਿਰਪਾ ਕਰਕੇ ਉਡੀਕ ਕਰੋ...",
+  "or-IN": "ଭଏସ୍ ଏଜେଣ୍ଟ ସହିତ ସଂଯୋଗ କରାଯାଉଛି, ଦୟାକରି ଅପେକ୍ଷା କରନ୍ତୁ...",
+  "en-IN": "Connecting to voice agent, please wait...",
+};
+const ENGLISH_VOICE_FILLER = "Connecting to voice agent, please wait...";
+
+const AGENT_STATUS_BY_LANGUAGE: Record<string, { speaking: string; listening: string }> = {
+  "hi-IN": { speaking: "बोल रहा है...", listening: "सुन रहा है..." },
+  "te-IN": { speaking: "మాట్లాడుతోంది...", listening: "వింటోంది..." },
+  "ta-IN": { speaking: "பேசுகிறது...", listening: "கேட்கிறது..." },
+  "ml-IN": { speaking: "സംസാരിക്കുന്നു...", listening: "കേൾക്കുന്നു..." },
+  "kn-IN": { speaking: "ಮಾತನಾಡುತ್ತಿದೆ...", listening: "ಕೇಳುತ್ತಿದೆ..." },
+  "bn-IN": { speaking: "বলছে...", listening: "শুনছে..." },
+  "gu-IN": { speaking: "બોલી રહ્યું છે...", listening: "સાંભળી રહ્યું છે..." },
+  "mr-IN": { speaking: "बोलत आहे...", listening: "ऐकत आहे..." },
+  "pa-IN": { speaking: "ਬੋਲ ਰਿਹਾ ਹੈ...", listening: "ਸੁਣ ਰਿਹਾ ਹੈ..." },
+  "or-IN": { speaking: "କହୁଛି...", listening: "ଶୁଣୁଛି..." },
+  "en-IN": { speaking: "Speaking...", listening: "Listening..." },
+};
+
+function getConnectingFiller(languageCode: string): string {
+  return CONNECTING_FILLER_BY_LANGUAGE[languageCode] ?? CONNECTING_FILLER_BY_LANGUAGE["en-IN"];
+}
+
+function getAgentStatusLabels(languageCode: string): { speaking: string; listening: string } {
+  return AGENT_STATUS_BY_LANGUAGE[languageCode] ?? AGENT_STATUS_BY_LANGUAGE["en-IN"];
+}
+
 const InfoIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
     <circle cx="12" cy="12" r="10" />
@@ -110,7 +147,116 @@ function timeLabel(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
+/** Show order / reference ids as one token: remove spaces between digits only. */
+function formatOrderIdForDisplay(id: string | undefined | null): string {
+  const s = id?.trim();
+  if (!s) {
+    return "—";
+  }
+  return s.replace(/(?<=\d)\s+(?=\d)/g, "").trim();
+}
+
+/** Collapse spaces between digits (phones read as "9 4 9 3 3 3...") and split order IDs like "453746 NE". */
+function formatTranscriptDisplay(text: string): string {
+  if (!text) {
+    return text;
+  }
+  let t = text;
+  // Phone-style: remove spaces between digits only (keep spaces before/after words)
+  t = t.replace(/(?<=\d)\s+(?=\d)/g, "");
+  // External order id often read as digits + space + letters
+  t = t.replace(/\b(\d{4,})\s+([A-Za-z]{2,8})\b/g, "$1$2");
+  return t;
+}
+
+function shouldMergeTranscriptTail(prev: string, next: string): boolean {
+  const p = prev.trimEnd();
+  const n = next.trim();
+  if (!p || !n || n.length > 12) {
+    return false;
+  }
+  const pDigits = p.replace(/(?<=\d)\s+(?=\d)/g, "");
+  // Continue phone / digit string across STT segments: "949" + "3336321"
+  if (/\d$/.test(pDigits) && /^\d[\d\s]*$/.test(n)) {
+    return true;
+  }
+  // Order id: "453746" + "NE" or "453746" + "N" + "E" (handled in two merges)
+  if (/\d{4,}$/.test(pDigits) && /^[A-Za-z]{1,8}$/.test(n)) {
+    return true;
+  }
+  const pAlnum = pDigits.replace(/\s/g, "");
+  if (/\d{4,}[A-Za-z]{0,6}$/.test(pAlnum) && /^[A-Za-z]{1,2}$/.test(n)) {
+    return true;
+  }
+  return false;
+}
+
+function mergeTranscriptText(prev: string, next: string): string {
+  const p = prev.trimEnd();
+  const n = next.trim();
+  if (/\d$/.test(p.replace(/(?<=\d)\s+(?=\d)/g, "")) && /^\d/.test(n)) {
+    return p.replace(/\s+$/g, "") + n.replace(/\s/g, "");
+  }
+  if (/\d{4,}$/.test(p.replace(/(?<=\d)\s+(?=\d)/g, "")) && /^[A-Za-z]/.test(n)) {
+    return p.replace(/\s+$/g, "") + n;
+  }
+  const pCompact = p.replace(/(?<=\d)\s+(?=\d)/g, "").replace(/\s/g, "");
+  if (/\d{4,}[A-Za-z]{0,6}$/.test(pCompact) && /^[A-Za-z]{1,2}$/.test(n)) {
+    return p.replace(/\s+$/g, "") + n;
+  }
+  return `${p} ${n}`;
+}
+
+function coalesceAdjacentTranscripts(lines: ChatPanelLine[]): ChatPanelLine[] {
+  const sorted = [...lines].sort((a, b) => a.updatedAt - b.updatedAt);
+  const out: ChatPanelLine[] = [];
+  for (const line of sorted) {
+    if (line.kind !== "transcript") {
+      out.push(line);
+      continue;
+    }
+    const last = out[out.length - 1];
+    if (
+      last?.kind === "transcript" &&
+      last.role === line.role &&
+      shouldMergeTranscriptTail(last.text, line.text)
+    ) {
+      out[out.length - 1] = {
+        ...last,
+        text: mergeTranscriptText(last.text, line.text),
+        updatedAt: Math.max(last.updatedAt, line.updatedAt),
+        final: last.final && line.final,
+      };
+    } else {
+      out.push(line);
+    }
+  }
+  return out;
+}
+
+/** Row styles for active-order list (distinct backgrounds for scanability). */
+const ORDER_ROW_STYLES: { bg: string; border: string; accent: string }[] = [
+  { bg: "rgba(34, 197, 94, 0.16)", border: "rgba(34, 197, 94, 0.5)", accent: "#6ee7b7" },
+  { bg: "rgba(59, 130, 246, 0.14)", border: "rgba(59, 130, 246, 0.45)", accent: "#93c5fd" },
+  { bg: "rgba(168, 85, 247, 0.14)", border: "rgba(168, 85, 247, 0.45)", accent: "#d8b4fe" },
+  { bg: "rgba(245, 158, 11, 0.14)", border: "rgba(245, 158, 11, 0.45)", accent: "#fcd34d" },
+  { bg: "rgba(236, 72, 153, 0.12)", border: "rgba(236, 72, 153, 0.4)", accent: "#f9a8d4" },
+  { bg: "rgba(20, 184, 166, 0.14)", border: "rgba(20, 184, 166, 0.45)", accent: "#5eead4" },
+];
+
+function ActiveCallRoom({
+  onDisconnected,
+  connectingMessage,
+  speakingMessage,
+  listeningMessage,
+  languageCode,
+}: {
+  onDisconnected: () => void;
+  connectingMessage: string;
+  speakingMessage: string;
+  listeningMessage: string;
+  languageCode: string;
+}) {
   const room = useRoomContext();
   const roomState = useConnectionState();
   const {
@@ -124,6 +270,10 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
 
   const [conversation, setConversation] = useState<ChatPanelLine[]>([]);
   const conversationRef = useRef<HTMLDivElement | null>(null);
+  const hasAgentRespondedRef = useRef(false);
+  const fillerLoopTimeoutRef = useRef<number | null>(null);
+  const isFillerSpeakingRef = useRef(false);
+  const activeFillerLangRef = useRef("");
 
   const localMicTrackRef = useMemo(
     () => ({
@@ -146,26 +296,107 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
     : !microphoneTrack
       ? "Waiting for microphone..."
       : isMicrophoneEnabled
-        ? "Listening for your voice"
-        : "Microphone is muted";
+        ? "Mic on — we hear you"
+        : "Mic off — tap Unmute only when you speak (reduces background noise)";
 
-  // Auto mute/unmute microphone when agent speaks to prevent echo and feedback
+  // Manual mic only: no auto mute/unmute from agent state (avoids fighting the user and always-on capture).
+  const startedMutedRef = useRef(false);
   useEffect(() => {
-    if (!microphoneTrack || !isConnected) {
+    if (roomState !== ConnectionState.Connected || !microphoneTrack || lastMicrophoneError || startedMutedRef.current) {
+      return;
+    }
+    startedMutedRef.current = true;
+    void localParticipant.setMicrophoneEnabled(false);
+  }, [roomState, microphoneTrack, lastMicrophoneError, localParticipant]);
+
+  const stopFillerLoop = useCallback((): void => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      return;
+    }
+    if (fillerLoopTimeoutRef.current != null) {
+      window.clearTimeout(fillerLoopTimeoutRef.current);
+      fillerLoopTimeoutRef.current = null;
+    }
+    window.speechSynthesis.cancel();
+    isFillerSpeakingRef.current = false;
+  }, []);
+
+  const scheduleFillerLoop = useCallback(function scheduleFillerLoopInner(): void {
+    if (
+      !isConnected ||
+      hasAgentRespondedRef.current ||
+      isFillerSpeakingRef.current ||
+      typeof window === "undefined" ||
+      !("speechSynthesis" in window)
+    ) {
       return;
     }
 
-    // Mute when agent is speaking or thinking (processing)
-    const shouldMute = agentState === "speaking" || agentState === "thinking";
-    
-    if (shouldMute && isMicrophoneEnabled) {
-      localParticipant.setMicrophoneEnabled(false);
+    const utterance = new SpeechSynthesisUtterance(ENGLISH_VOICE_FILLER);
+    utterance.lang = "en-IN";
+    utterance.rate = 1;
+    utterance.pitch = 1;
+
+    const voices = window.speechSynthesis.getVoices();
+    const matchedVoice =
+      voices.find((v) => v.lang.toLowerCase() === utterance.lang.toLowerCase()) ||
+      voices.find((v) => v.lang.toLowerCase().startsWith("en"));
+    if (matchedVoice) {
+      utterance.voice = matchedVoice;
     }
-    // Unmute only when agent is listening (ready for user input)
-    else if (agentState === "listening" && !isMicrophoneEnabled && !lastMicrophoneError) {
-      localParticipant.setMicrophoneEnabled(true);
+
+    utterance.onstart = () => {
+      isFillerSpeakingRef.current = true;
+    };
+    utterance.onend = () => {
+      isFillerSpeakingRef.current = false;
+      if (hasAgentRespondedRef.current || !isConnected) {
+        return;
+      }
+      fillerLoopTimeoutRef.current = window.setTimeout(() => {
+        scheduleFillerLoopInner();
+      }, 2000);
+    };
+    utterance.onerror = () => {
+      isFillerSpeakingRef.current = false;
+      if (hasAgentRespondedRef.current || !isConnected) {
+        return;
+      }
+      fillerLoopTimeoutRef.current = window.setTimeout(() => {
+        scheduleFillerLoopInner();
+      }, 2000);
+    };
+    window.speechSynthesis.resume();
+    window.speechSynthesis.speak(utterance);
+  }, [isConnected]);
+
+  useEffect(() => {
+    if (!isConnected) {
+      hasAgentRespondedRef.current = false;
+      activeFillerLangRef.current = "";
+      stopFillerLoop();
+      return;
     }
-  }, [agentState, isConnected, microphoneTrack, isMicrophoneEnabled, localParticipant, lastMicrophoneError]);
+    if (agentState === "speaking") {
+      hasAgentRespondedRef.current = true;
+      stopFillerLoop();
+      return;
+    }
+    if (hasAgentRespondedRef.current) {
+      return;
+    }
+    if (activeFillerLangRef.current !== languageCode) {
+      stopFillerLoop();
+      activeFillerLangRef.current = languageCode;
+    }
+    scheduleFillerLoop();
+  }, [isConnected, agentState, languageCode, scheduleFillerLoop, stopFillerLoop]);
+
+  useEffect(() => {
+    return () => {
+      stopFillerLoop();
+    };
+  }, [stopFillerLoop]);
 
   useEffect(() => {
     const handleTranscription = (
@@ -182,6 +413,9 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
         participant.kind === ParticipantKind.AGENT;
 
       const role: TranscriptRole = isAgentSpeaker ? "agent" : "user";
+      if (isAgentSpeaker) {
+        hasAgentRespondedRef.current = true;
+      }
 
       const speakerLabel =
         role === "agent"
@@ -221,7 +455,8 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
         }
 
         next.sort((a, b) => a.updatedAt - b.updatedAt);
-        return next.slice(-80);
+        const merged = coalesceAdjacentTranscripts(next);
+        return merged.slice(-80);
       });
     };
 
@@ -261,7 +496,7 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
           orders,
         };
         setConversation((prev) => {
-          const next = [...prev, line];
+          const next = coalesceAdjacentTranscripts([...prev, line]);
           next.sort((a, b) => a.updatedAt - b.updatedAt);
           return next.slice(-80);
         });
@@ -306,8 +541,8 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
             {remoteAgents.length > 0
               ? remoteAgents.map((p) => p.identity).join(", ")
               : agentState
-                ? `Connecting (${agentState})`
-                : "Waiting for agent..."}
+                ? connectingMessage
+                : connectingMessage}
           </div>
         </div>
       </div>
@@ -321,9 +556,9 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
             <div className="agent-avatar__status">
               {isConnected
                 ? isAgentSpeaking
-                  ? "Speaking..."
-                  : "Listening..."
-                : `Room: ${roomState}...`}
+                  ? speakingMessage
+                  : listeningMessage
+                : connectingMessage}
             </div>
 
             <BarVisualizer
@@ -354,18 +589,34 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
                     <div className="order-ids-panel">
                       <p className="order-ids-panel__hint">{item.hint}</p>
                       <p className="order-ids-panel__label">Order ID (app id when available)</p>
-                      <ol className="order-ids-panel__list">
-                        {item.orders.map((row, idx) => (
-                          <li key={`${item.key}-row-${idx}`} className="order-ids-panel__item">
-                            <span className="order-ids-panel__id">
-                              {row.external_order_id?.trim() || "—"}
-                            </span>
-                            {row.status != null && row.status !== "" && (
-                              <span className="order-ids-panel__status"> · {String(row.status)}</span>
-                            )}
-                          </li>
-                        ))}
-                      </ol>
+                      <ul className="order-ids-panel__list">
+                        {item.orders.map((row, idx) => {
+                          const palette = ORDER_ROW_STYLES[idx % ORDER_ROW_STYLES.length];
+                          const idDisplay = formatOrderIdForDisplay(row.external_order_id);
+                          return (
+                            <li
+                              key={`${item.key}-row-${idx}`}
+                              className="order-ids-panel__item"
+                              style={{
+                                background: palette.bg,
+                                borderColor: palette.border,
+                              }}
+                            >
+                              <span className="order-ids-panel__index" style={{ color: palette.accent }}>
+                                {idx + 1}.
+                              </span>
+                              <span className="order-ids-panel__id-wrap">
+                                <span className="order-ids-panel__id" style={{ color: palette.accent }}>
+                                  {idDisplay}
+                                </span>
+                                {row.status != null && row.status !== "" && (
+                                  <span className="order-ids-panel__status"> · {String(row.status)}</span>
+                                )}
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
                     </div>
                   </div>
                 ) : (
@@ -379,7 +630,9 @@ function ActiveCallRoom({ onDisconnected }: { onDisconnected: () => void }) {
                       <span>{item.speakerLabel}</span>
                       <span>{timeLabel(item.updatedAt)}</span>
                     </div>
-                    <div className="conversation-row__bubble">{item.text}</div>
+                    <div className="conversation-row__bubble transcript-bubble-text">
+                      {formatTranscriptDisplay(item.text)}
+                    </div>
                   </div>
                 ),
               )
@@ -439,6 +692,8 @@ export default function Home() {
   const [errorMsg, setErrorMsg] = useState("");
   const [selectedLanguage, setSelectedLanguage] = useState(SUPPORTED_LANGUAGES[0]);
   const [showLangModal, setShowLangModal] = useState(false);
+  const connectingMessage = getConnectingFiller(selectedLanguage.code);
+  const agentStatusLabels = getAgentStatusLabels(selectedLanguage.code);
 
   const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -510,7 +765,13 @@ export default function Home() {
           }}
           data-lk-theme="default"
         >
-          <ActiveCallRoom onDisconnected={onDisconnected} />
+          <ActiveCallRoom
+            onDisconnected={onDisconnected}
+            connectingMessage={connectingMessage}
+            speakingMessage={agentStatusLabels.speaking}
+            listeningMessage={agentStatusLabels.listening}
+            languageCode={selectedLanguage.code}
+          />
         </LiveKitRoom>
       </div>
     );
@@ -556,7 +817,7 @@ export default function Home() {
                 marginBottom: "1rem",
               }}
             >
-              {connecting ? "Handshaking with LiveKit..." : "Start Support Call"}
+              {connecting ? connectingMessage : "Start Support Call"}
             </button>
             <br />
             <button

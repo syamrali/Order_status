@@ -33,6 +33,10 @@ Set these in `.env`:
 
 ```env
 SARVAM_API_KEY=...
+LLM_PROVIDER=google
+GOOGLE_API_KEY=...
+GOOGLE_MODEL=gemini-2.5-flash-lite
+# Optional fallback
 GROQ_API_KEY=...
 LIVEKIT_URL=...
 LIVEKIT_API_KEY=...
@@ -52,6 +56,7 @@ NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
 Notes:
 - `FARMER_ENGAGEMENT_DATABASE_URL` is optional. If missing, the app reuses `DATABASE_URL`.
 - URLs can be `postgres://` / `postgresql://`; backend auto-converts to async driver format.
+- LLM provider is selected by `LLM_PROVIDER` (`google` default, `groq` optional fallback).
 
 ## Run
 
@@ -70,6 +75,23 @@ docker compose up --build -d
 
 - `GET /health`
   - returns backend health + livekit key configuration status
+
+## Latency debugging (what is slow?)
+
+The **worker** logs lines prefixed with `[TIMING]`:
+
+| Log | Meaning |
+|-----|--------|
+| `STT Sarvam HTTP` / `STT total` | Network + Sarvam speech-to-text for that utterance (often 200ms–2s per attempt). |
+| `DB resolve_users_by_phone` | Farmer-engagement DB lookup by phone (usually tens–hundreds of ms on a healthy network). |
+| `DB list_active_orders_for_user` | Orders DB query after name confirmation (heavier than step 1 if many rows). |
+| `tool get_order_status_from_db` | Full tool handler including DB calls above. |
+| `user_turn_completed` | Text the **LLM** attributed to the user after STT (use to align with chat UI). |
+| `TTS Sarvam total` | Sarvam text-to-speech for the agent reply. |
+
+**Not printed directly:** time inside **Groq (LLM)** and **LiveKit Agents** (deciding to call tools, merging context). If wall-clock delay is large but every `[TIMING]` line is small, investigate **LLM latency**, **LiveKit ↔ worker** connectivity, or **worker CPU** (e.g. `docker compose logs -f` for `backend-worker`).
+
+**Frontend:** If the mic is **muted**, new speech is not sent; the transcript you already see was captured while the mic was **unmuted**. Muting after speaking does not block the agent’s reply.
 
 ## Key Files
 

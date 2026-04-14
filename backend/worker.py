@@ -4,9 +4,11 @@ import io
 import json
 import os
 import re
+import time
 import struct
 import uuid
 import wave
+from difflib import SequenceMatcher
 from typing import Any, Optional
 
 import httpx
@@ -27,7 +29,7 @@ from livekit.agents import (
 )
 from livekit.agents.voice import Agent, AgentSession
 from livekit.agents.voice.agent_session import SessionConnectOptions
-from livekit.plugins import openai, silero, groq
+from livekit.plugins import google, silero, groq
 
 from order_lookup import OrderLookupService
 
@@ -52,20 +54,126 @@ STT_EMPTY_FALLBACK_USER_TEXT = ""
 
 ORDER_LOOKUP = OrderLookupService.from_env()
 
+# How long silence must last before "end of user speech" (seconds). Higher = fewer false cuts but
+# noticeably slower replies after the user stops talking (e.g. after giving a phone number).
+def _env_float(key: str, default: str, lo: float, hi: float) -> float:
+    try:
+        v = float((os.environ.get(key) or default).strip() or default)
+    except ValueError:
+        v = float(default)
+    return max(lo, min(hi, v))
+
+
+# End-of-utterance silence (seconds). Using ~1s avoids clipping short names at turn boundaries.
+_VAD_MIN_SILENCE = _env_float("VAD_MIN_SILENCE_DURATION", "1.0", 0.25, 2.0)
+
+# Minimum speech length (seconds) before a segment counts.
+# Keep this low so short names like "Mohan" are not dropped.
+_VAD_MIN_SPEECH = _env_float("VAD_MIN_SPEECH_DURATION", "0.12", 0.08, 1.0)
+
+# Silero probability thresholds (0–1). Higher activation = stricter “is this speech?” — helps reject
+# side voices & ambient noise, but can miss very soft talkers (tune per deployment).
+_VAD_ACTIVATION = _env_float("VAD_ACTIVATION_THRESHOLD", "0.68", 0.35, 0.95)
+_VAD_DEACTIVATION = _env_float("VAD_DEACTIVATION_THRESHOLD", "0.38", 0.1, 0.9)
+if _VAD_DEACTIVATION >= _VAD_ACTIVATION:
+    _VAD_DEACTIVATION = max(0.1, _VAD_ACTIVATION - 0.05)
+
 # Pre-load VAD model once at startup — avoids reloading per session (saves RAM + time)
 _VAD_MODEL = silero.VAD.load(
-    min_silence_duration=1.0,
-    min_speech_duration=0.3,
-    activation_threshold=0.6,
-    deactivation_threshold=0.3,
+    min_silence_duration=_VAD_MIN_SILENCE,
+    min_speech_duration=_VAD_MIN_SPEECH,
+    activation_threshold=_VAD_ACTIVATION,
+    deactivation_threshold=_VAD_DEACTIVATION,
+)
+print(
+    "[Worker] VAD:",
+    f"silence={_VAD_MIN_SILENCE}s",
+    f"min_speech={_VAD_MIN_SPEECH}s",
+    f"activation={_VAD_ACTIVATION}",
+    f"deactivation={_VAD_DEACTIVATION}",
 )
 
-# Google Gemini configuration (unused — using Groq)
+# LLM provider selection: default Gemini, keep Groq available as backup.
+LLM_PROVIDER = (os.environ.get("LLM_PROVIDER") or "google").strip().lower()
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GOOGLE_MODEL = (os.environ.get("GOOGLE_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 
+
+def _build_llm():
+    if LLM_PROVIDER in {"google", "gemini"}:
+        if not GOOGLE_API_KEY:
+            raise ValueError("GOOGLE_API_KEY is required when LLM_PROVIDER=google")
+        print(f"[Worker] LLM provider=google model={GOOGLE_MODEL!r}")
+        return google.LLM(
+            model=GOOGLE_MODEL,
+            api_key=GOOGLE_API_KEY,
+        )
+
+    if LLM_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
+        print(f"[Worker] LLM provider=groq model={GROQ_MODEL!r}")
+        return groq.LLM(
+            model=GROQ_MODEL,
+            api_key=GROQ_API_KEY,
+        )
+
+    raise ValueError("Unsupported LLM_PROVIDER. Use 'google' or 'groq'.")
+
 # Sarvam TTS has a ~500 char limit per request; longer text gets cut off silently.
 TTS_MAX_CHARS = 450
+
+
+def _ms_since(t0: float) -> float:
+    return (time.perf_counter() - t0) * 1000.0
+
+
+def _coerce_tool_bool(value: Any) -> bool:
+    """Groq/JSON sometimes yields strings; normalize for tool logic."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _digits_only(value: str | None) -> str:
+    return re.sub(r"[^0-9]", "", str(value or ""))
+
+
+def _canonical_mobile_last10(value: str | None) -> str | None:
+    """
+    Indian mobiles: keep last 10 digits when caller says 10 digits, 11 with leading 0,
+    or 12+ with country code 91… — STT often returns 11 digits.
+    """
+    d = _digits_only(value)
+    if len(d) < 10:
+        return None
+    return d[-10:]
+
+
+def _extract_order_ref_candidate(value: str | None) -> str:
+    """
+    Pull an order reference token from user text, e.g. '439473NE' or 'order id 439473NE'.
+    Keeps alnum only; prefers tokens with at least one digit.
+    """
+    s = (value or "").strip()
+    if not s:
+        return ""
+    compact = re.sub(r"[^A-Za-z0-9\s]", " ", s)
+    tokens = [t.strip() for t in compact.split() if t.strip()]
+    # Merge split refs like "439477 PF" -> "439477PF"
+    for i in range(len(tokens) - 1):
+        a, b = tokens[i], tokens[i + 1]
+        if re.fullmatch(r"\d{4,}", a) and re.fullmatch(r"[A-Za-z]{1,4}", b):
+            return f"{a}{b}".upper()
+    # Prefer tokens that look like order refs (contains digits, at least 4 chars)
+    for t in reversed(tokens):
+        if re.search(r"\d", t) and len(t) >= 4:
+            return t.upper()
+    return ""
 
 
 async def publish_active_order_ids_to_ui(active_orders: list[dict[str, Any]], hint: str) -> None:
@@ -155,6 +263,7 @@ class SarvamSTT(stt.STT):
         language: str | None = None,
         conn_options: Any | None = None,
     ) -> stt.SpeechEvent:
+        t_stt_total = time.perf_counter()
         combined_frame = rtc.combine_audio_frames(buffer)
         src_rate = combined_frame.sample_rate
         src_channels = combined_frame.num_channels
@@ -183,9 +292,11 @@ class SarvamSTT(stt.STT):
         text = ""
         for mode in modes:
             try:
+                t_mode = time.perf_counter()
                 text = await self._sarvam_stt_once(
                     self._client, wav_data, mode=mode, language_code=lang
                 )
+                print(f"[TIMING] STT Sarvam HTTP mode={mode} {_ms_since(t_mode):.0f}ms")
             except Exception as exc:
                 print(f"[STT] mode={mode} lang={lang} failed: {exc}")
                 continue
@@ -196,15 +307,18 @@ class SarvamSTT(stt.STT):
         # Spoken digits are often tagged en-IN; retry transcribe with English if still empty.
         if not text and lang not in ("en-IN", "en", "unknown"):
             try:
+                t_fb = time.perf_counter()
                 text = await self._sarvam_stt_once(
                     self._client, wav_data, mode="transcribe", language_code="en-IN"
                 )
+                print(f"[TIMING] STT Sarvam HTTP fallback en-IN {_ms_since(t_fb):.0f}ms")
                 if text:
                     print(f"[STT] fallback en-IN transcribe transcript: '{text}'")
             except Exception as exc:
                 print(f"[STT] fallback en-IN transcribe failed: {exc}")
 
         if not text:
+            print(f"[TIMING] STT total {_ms_since(t_stt_total):.0f}ms (empty transcript)")
             print("[STT] All attempts returned empty — agent will remain silent")
             return stt.SpeechEvent(
                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -213,7 +327,11 @@ class SarvamSTT(stt.STT):
 
         # Clean up trailing punctuation that Sarvam STT adds (especially periods after numbers)
         text = text.rstrip('.!?,;:')
-        
+
+        print(
+            f"[TIMING] STT total {_ms_since(t_stt_total):.0f}ms chars={len(text)} "
+            f"preview={text[:72]!r}{'…' if len(text) > 72 else ''}"
+        )
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[stt.SpeechData(text=text, language=self.language)],
@@ -226,6 +344,7 @@ class SarvamChunkedStream(tts.ChunkedStream):
         self._tts = tts_instance
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        t_tts = time.perf_counter()
         # Use distinct natural voices per language (not bright/energetic ones)
         speaker_map = {
             "hi-IN": "rohan",   # Hindi - smooth, professional male
@@ -305,6 +424,7 @@ class SarvamChunkedStream(tts.ChunkedStream):
         )
         output_emitter.push(wav_bytes)
         output_emitter.flush()
+        print(f"[TIMING] TTS Sarvam total {_ms_since(t_tts):.0f}ms chars_in={len(clean_text)} wav_bytes={len(wav_bytes)}")
 
 
 class SarvamTTS(tts.TTS):
@@ -453,25 +573,28 @@ Example responses:
 ### STEP 1: COLLECT MOBILE NUMBER
 - Ask for 10-digit mobile number in a friendly way
 - When user speaks a number, extract ONLY the digits (ignore periods, spaces, dashes)
-- Count ONLY the digit characters
-- If NOT exactly 10 digits:
+- If there are FEWER than 10 digits:
   → Respond politely: "Hmm, that number looks a bit off, can you say it once again?"
   → Do NOT call any tool
   → Ask again
-- If exactly 10 digits:
+- If there are 10 OR MORE digits (including 10-digit mobile, or 11 with a leading zero, or 12 with country code 91):
   → Silently call: get_order_status_from_db(phone_number=..., customer_confirmed=false)
-  → Pass the full number as spoken (the tool will clean it)
+  → Pass the digits as spoken or grouped; the tool keeps the **last 10 digits** for matching
   → Wait for tool response
+  → If the tool returns confirmation_required: do NOT add filler or long preambles — in ONE short sentence, ask for their name only (this must feel instant after they give the number).
 
 ### STEP 2: NAME CONFIRMATION (STRICT VALIDATION REQUIRED)
 - After phone number is validated, ALWAYS ask for name confirmation for security
 - Ask casually: "Just to confirm, can I know your name?"
+- When the user answers, they may say full sentences like "my name is Syam Mohan" — only the **name itself** counts; ignore filler phrases when reasoning about a match.
+- Prefer short answers: "Syam Mohan" or "Mohan" are valid; do not ask them to repeat in a longer form.
+- When you call the tool to confirm identity after they spoke their name, you MUST pass **caller_spoken_name** set to the **exact name phrase** they used (copy from the latest user transcript), e.g. `caller_spoken_name="Syam Mohan"` or `caller_spoken_name="my name is Syam Mohan"`. This is required so the server can match it to the database even if timing differs from the transcript buffer.
 - When user provides their name, validate it against database records:
   → If name matches: Say "Thank you, name confirmed!" or similar positive confirmation
   → If name doesn't match: Say "The name doesn't match our records, please provide the correct name"
 - Only proceed to orders after successful name validation
 - After successful name confirmation:
-  → Silently call: get_order_status_from_db(phone_number=..., customer_confirmed=true)
+  → Silently call: get_order_status_from_db(phone_number=..., customer_confirmed=true, caller_spoken_name=...same name phrase...)
   → Wait for tool response
 
 ### STEP 3: PROVIDE ORDER STATUS
@@ -490,12 +613,22 @@ Example responses:
   
 - If tool returns multiple orders (order_selection_required):
   → Tell how many orders found
+  → Read only the exact order IDs from tool output (active_orders list)
+  → NEVER use sample/placeholder IDs (like 1234, 5678, 9012)
   → Read each order ID as ONE complete number (never split)
   → Ask which one they want to check
   → After user picks one:
-    → Silently call: get_order_status_from_db(customer_confirmed=true, external_order_id=...)
+    → Silently call: get_order_status_from_db(customer_confirmed=true, external_order_id=..., caller_spoken_name=...optional if you still have their name phrase...)
     → Speak that order's status
     → Done
+
+- If tool returns order_selection_already_shared:
+  → Do NOT repeat the same order list again
+  → In one short sentence, ask the caller to say one order ID from the displayed list
+
+- If tool returns order_status_already_shared:
+  → Do NOT repeat the same status again
+  → In one short sentence, ask if they want another order or any other help
 
 - If tool returns error (invalid_phone, not found):
   → Apologize politely
@@ -505,6 +638,8 @@ Example responses:
 - Keep responses short (1–2 sentences max)
 - Speak like a human, not a system
 - Phone numbers & order IDs: Always say as ONE full number (never split into groups)
+- NEVER invent or guess order IDs/statuses/customer names. If the tool response is not ok, or reason is db_error/not_configured/customer_not_found/invalid_phone/name_mismatch, say that clearly and ask for retry/correction.
+- If reason is confirmation_required, only ask for name confirmation; do not mention order count or order IDs yet.
 - Only provide order status from tool response:
   → Use latest_status.latest_status
   → Fallback: order.status
@@ -532,14 +667,157 @@ def build_order_support_instructions(language_code: str) -> str:
     )
 
 
+# Strip leading "my name is …" / "I am …" so we match on name tokens only (STT often returns full sentences).
+_NAME_LEADING_PATTERN = re.compile(
+    r"""^\s*(?:
+        my\s+name\s+is|the\s+name\s+is|name\s+is|
+        i\s*['\u2019]?\s*m|i\s+am|this\s+is|it\s*['\u2019]?\s*s|
+        call\s+me|mine\s+is|here\s+is|you\s+can\s+call\s+me|
+        मेरा\s+नाम|नाम\s+है
+    )\s*[,:]?\s*""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+_NAME_TRAILING_FILLER = re.compile(
+    r"\s+(?:please|thanks|thank\s+you|thankyou|ji|only|actually|sir|madam)\s*$",
+    re.IGNORECASE,
+)
+
+# Words that are not part of a person's name but appear in natural answers.
+_NAME_NOISE_WORDS = frozenset(
+    {
+        "my",
+        "name",
+        "is",
+        "the",
+        "am",
+        "i",
+        "im",
+        "its",
+        "it",
+        "this",
+        "that",
+        "call",
+        "me",
+        "yes",
+        "yeah",
+        "hello",
+        "hi",
+        "here",
+        "please",
+        "actually",
+        "only",
+        "correct",
+        "right",
+        "okay",
+        "ok",
+        "from",
+        "side",
+        "line",
+    }
+)
+
+# Common STT / spelling variants for the same spoken name (Indian English). Extend as needed.
+_NAME_TOKEN_ALIASES: dict[str, frozenset[str]] = {
+    "syam": frozenset({"shyam", "sham", "shiyaam", "syaam", "shyaam"}),
+    "shyam": frozenset({"syam", "sham", "shiyaam"}),
+    "sankar": frozenset({"shankar", "sanker", "shanker"}),
+    "shankar": frozenset({"sankar", "sanker", "shanker"}),
+}
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        cur = [i + 1]
+        for j, cb in enumerate(b):
+            cur.append(min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _sound_simplify(token: str) -> str:
+    """
+    Small phonetic normalization for common Indic-English STT variants:
+    shyam/syam, shankar/sankar, f/ph, long vowels, etc.
+    """
+    t = (token or "").lower().strip()
+    if not t:
+        return t
+    t = t.replace("ph", "f")
+    t = t.replace("sh", "s")
+    t = t.replace("ck", "k")
+    t = t.replace("aa", "a").replace("ee", "i").replace("oo", "u")
+    return t
+
+
+def extract_spoken_name_for_match(raw: str | None) -> str:
+    """Return text after stripping 'my name is …' style prefixes and trailing fillers."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = _NAME_LEADING_PATTERN.sub("", s, count=1)
+    s = _NAME_TRAILING_FILLER.sub("", s).strip()
+    s = re.sub(r"^[,\s:]+", "", s)
+    return s.strip()
+
+
+# Groq/OpenAI strict tool validation may treat inferred schemas as "all fields required".
+# Explicit JSON schema: only customer_confirmed is required; other args may be omitted.
+_GET_ORDER_STATUS_FROM_DB_RAW_SCHEMA: dict[str, Any] = {
+    "name": "get_order_status_from_db",
+    "description": (
+        "Look up the customer by phone, then confirm identity and return order status. "
+        "Use customer_confirmed=false with phone_number for the first lookup. "
+        "Use customer_confirmed=true after the caller states their name; pass caller_spoken_name "
+        "with their exact words from the conversation when possible. "
+        "Use external_order_id only when the caller chooses one order among several active ones."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "phone_number": {
+                "type": "string",
+                "description": (
+                    "Customer mobile: 10 digits, or with leading 0 / country code 91 (tool keeps last 10 digits). "
+                    "Required on first lookup when customer_confirmed is false (unless session already stored the number)."
+                ),
+            },
+            "customer_confirmed": {
+                "type": "boolean",
+                "description": "false when validating phone only; true after name confirmation or when resolving a chosen order id.",
+            },
+            "external_order_id": {
+                "type": "string",
+                "description": "App-facing order id when the caller selects one of multiple active orders; otherwise omit.",
+            },
+            "caller_spoken_name": {
+                "type": "string",
+                "description": "Verbatim name phrase the caller used (for identity match). Strongly recommended when customer_confirmed is true for name verification.",
+            },
+        },
+        "required": ["customer_confirmed"],
+    },
+}
+
+
 class OrderSupportAgent(Agent):
     def __init__(self, *, language_code: str) -> None:
         super().__init__(instructions=build_order_support_instructions(language_code))
         self._language_code = language_code
         self._user_turn_index = 0
         self._latest_user_text = ""
+        self._recent_user_texts: list[str] = []
         self._pending_phone: str | None = None
         self._pending_customer: dict[str, Any] | None = None
+        self._last_order_status_signature: str = ""
+        self._last_active_orders_signature: str = ""
 
     @staticmethod
     def _normalize_text(value: str | None) -> str:
@@ -548,54 +826,141 @@ class OrderSupportAgent(Agent):
         s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
         return re.sub(r"\s+", " ", s).strip()
 
+    @staticmethod
+    def _tokens_alias_or_fuzzy_match(a: str, b: str) -> bool:
+        """True if two name tokens are equal, alias-linked, or close enough for STT spelling drift."""
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        for canon, variants in _NAME_TOKEN_ALIASES.items():
+            bag = {canon} | set(variants)
+            if a in bag and b in bag:
+                return True
+        max_len = max(len(a), len(b))
+        if max_len <= 2:
+            return a == b
+        lev = _levenshtein(a, b)
+        max_dist = 1 if max_len <= 5 else 2
+        if lev <= max_dist:
+            return True
+        sa, sb = _sound_simplify(a), _sound_simplify(b)
+        if sa == sb:
+            return True
+        if sa and sb and _levenshtein(sa, sb) <= (1 if max(len(sa), len(sb)) <= 5 else 2):
+            return True
+        return SequenceMatcher(None, a, b).ratio() >= 0.86
+
+    def _spoken_name_tokens(self, spoken_text: str) -> list[str]:
+        """Tokens used for matching: strip 'my name is…', drop filler words."""
+        extracted = extract_spoken_name_for_match(spoken_text)
+        base = extracted if extracted else spoken_text
+        norm = self._normalize_text(base)
+        parts = [p for p in norm.split() if p.strip() and p not in _NAME_NOISE_WORDS]
+        if parts:
+            return parts
+        # Fallback: normalized full string (single unusual token)
+        return [norm] if norm else []
+
+    @staticmethod
+    def _looks_like_phone_number_only(s: str) -> bool:
+        """True if the string is almost only digits (stale transcript from the phone step)."""
+        if not (s or "").strip():
+            return False
+        digits = re.sub(r"[^0-9]", "", s)
+        has_letters = bool(re.search(r"[A-Za-z\u0080-\u1fff]", s))
+        return len(digits) >= 8 and not has_letters
+
+    def _snippet_for_name_match(
+        self,
+        caller_spoken_name: Optional[str],
+        raw_arguments: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """
+        Prefer explicit name from the LLM tool args; else last user text unless it still looks
+        like a phone number (common race: tool runs before transcript buffer updates).
+        """
+        explicit = (caller_spoken_name or "").strip()
+        if explicit:
+            return explicit
+        # Some providers pass raw tool payload/meta; recover caller_spoken_name when present.
+        if isinstance(raw_arguments, dict):
+            raw_name = str(raw_arguments.get("caller_spoken_name") or "").strip()
+            if raw_name:
+                return raw_name
+        latest = (self._latest_user_text or "").strip()
+        if self._looks_like_phone_number_only(latest):
+            # Race-safe fallback: walk recent user turns and pick the newest non-phone utterance.
+            for prev in reversed(self._recent_user_texts):
+                p = (prev or "").strip()
+                if p and not self._looks_like_phone_number_only(p):
+                    return p
+            return ""
+        return latest
+
     def _is_name_match(self, spoken_text: str, db_name: str) -> bool:
         """
-        Strict name matching - checks if spoken name matches database name.
-        Handles various formats: first name only, last name only, or full name.
+        Match spoken name to DB (first+last). Handles:
+        - Full sentences ('my name is …') via extraction + noise-word drop
+        - Single first or last name
+        - STT spelling variants (Syam/Shyam, Sankar/Shankar) via fuzzy + alias map
         """
         if not spoken_text or not db_name:
             return False
-            
-        # Normalize both names for comparison
-        spoken_normalized = self._normalize_text(spoken_text)
+
         db_normalized = self._normalize_text(db_name)
-        
-        if not spoken_normalized or not db_normalized:
+        if not db_normalized:
             return False
-        
-        # If database name is just "Customer", accept any reasonable name
+
+        spoken_parts = self._spoken_name_tokens(spoken_text)
+        db_parts = [p for p in db_normalized.split() if p.strip()]
+
+        if not spoken_parts or not db_parts:
+            return False
+
+        # If database name is just "Customer", accept any reasonable name (2+ chars total)
         if db_normalized == "customer":
-            return len(spoken_normalized) > 1  # Any name with more than 1 character
-        
-        # Split database name into parts (first_name + last_name)
-        db_parts = [part.strip() for part in db_normalized.split() if part.strip()]
-        spoken_parts = [part.strip() for part in spoken_normalized.split() if part.strip()]
-        
-        if not db_parts or not spoken_parts:
-            return False
-        
-        # Check various matching scenarios:
-        # 1. Exact full name match
-        if spoken_normalized == db_normalized:
+            joined = " ".join(spoken_parts)
+            return len(joined.strip()) > 1
+
+        spoken_joined = " ".join(spoken_parts)
+        # Whole-string fuzzy (helps 'syam mohan' vs 'shyam mohan')
+        if SequenceMatcher(None, spoken_joined, db_normalized).ratio() >= 0.86:
             return True
-        
-        # 2. Spoken name contains all database name parts (as complete words)
-        if all(any(part == spoken_word for spoken_word in spoken_parts) for part in db_parts):
+        if spoken_joined == db_normalized:
             return True
-        
-        # 3. Database name contains all spoken name parts (as complete words)
-        if all(any(part == db_word for db_word in db_parts) for part in spoken_parts):
+        # Compact compare (spaces / minor STT punctuation differences)
+        compact_s = spoken_joined.replace(" ", "")
+        compact_d = db_normalized.replace(" ", "")
+        if len(compact_d) >= 3 and compact_s and SequenceMatcher(None, compact_s, compact_d).ratio() >= 0.86:
             return True
-        
-        # 4. First name exact match (if user only says first name)
-        if len(spoken_parts) == 1 and len(db_parts) > 0 and spoken_parts[0] == db_parts[0]:
+
+        def each_db_token_matches_spoken() -> bool:
+            for d in db_parts:
+                if not any(self._tokens_alias_or_fuzzy_match(d, s) for s in spoken_parts):
+                    return False
             return True
-        
-        # 5. Last name exact match (if user only says last name)
-        if len(spoken_parts) == 1 and len(db_parts) > 1 and spoken_parts[0] == db_parts[-1]:
+
+        def each_spoken_token_matches_db() -> bool:
+            for s in spoken_parts:
+                if not any(self._tokens_alias_or_fuzzy_match(s, d) for d in db_parts):
+                    return False
             return True
-        
-        # No match found
+
+        # Accept either direction so middle names / short spoken variants are not rejected.
+        if each_db_token_matches_spoken() or each_spoken_token_matches_db():
+            return True
+
+        # Single spoken token: try against first name, last name, or full string
+        if len(spoken_parts) == 1:
+            one = spoken_parts[0]
+            if len(db_parts) == 1:
+                return self._tokens_alias_or_fuzzy_match(one, db_parts[0])
+            if any(self._tokens_alias_or_fuzzy_match(one, d) for d in db_parts):
+                return True
+            if self._tokens_alias_or_fuzzy_match(one, db_normalized.replace(" ", "")):
+                return True
+
         return False
 
     def _is_affirmative_confirmation(self, text: str, customer_name: str | None) -> bool:
@@ -686,13 +1051,23 @@ class OrderSupportAgent(Agent):
     ) -> None:
         self._user_turn_index += 1
         self._latest_user_text = new_message.text_content or ""
+        self._recent_user_texts.append(self._latest_user_text)
+        if len(self._recent_user_texts) > 8:
+            self._recent_user_texts = self._recent_user_texts[-8:]
+        raw = self._latest_user_text
+        print(
+            f"[TIMING] user_turn_completed #{self._user_turn_index} "
+            f"chars={len(raw)} preview={raw[:100]!r}{'…' if len(raw) > 100 else ''}"
+        )
 
-    @llm.function_tool
+    @llm.function_tool(raw_schema=_GET_ORDER_STATUS_FROM_DB_RAW_SCHEMA)
     async def get_order_status_from_db(
         self,
         phone_number: Optional[str] = None,
         customer_confirmed: bool = False,
         external_order_id: Optional[str] = None,
+        caller_spoken_name: Optional[str] = None,
+        raw_arguments: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         Resolve a customer by phone number, confirm identity, then fetch status for an active order.
@@ -703,30 +1078,81 @@ class OrderSupportAgent(Agent):
             customer_confirmed: Set to true only after the caller confirms the resolved customer name.
             external_order_id: After order_selection_required, the app-facing order ID the caller chose.
                 Omit if only one active order.
+            caller_spoken_name: When customer_confirmed=true for a name check, pass the exact name phrase
+                the caller just said (from the latest user transcript). Strongly recommended — avoids
+                mismatches when the internal transcript buffer still holds the phone number.
+            raw_arguments: LiveKit raw tool payload passthrough (ignored by app logic).
         """
+        _ = raw_arguments  # intentionally unused
+        customer_confirmed = _coerce_tool_bool(customer_confirmed)
+
         # 1. Resolve effective phone — reuse cached value whenever caller omits it
         effective_phone = phone_number
         if self._pending_phone and (not effective_phone or not str(effective_phone).strip()):
             effective_phone = self._pending_phone
 
-        # 1b. Validate phone digit count — must be exactly 10 digits
-        if effective_phone and not customer_confirmed:
-            digits_only = re.sub(r"[^0-9]", "", str(effective_phone))
-            if len(digits_only) != 10:
+        # 1d. If caller is selecting an order but model forgot external_order_id, recover it from speech.
+        if customer_confirmed and not (external_order_id or "").strip():
+            order_ref = _extract_order_ref_candidate(caller_spoken_name) or _extract_order_ref_candidate(self._latest_user_text)
+            if order_ref:
+                external_order_id = order_ref
+                print(f"[Worker] Recovered external_order_id from speech: {external_order_id!r}")
+
+        # 1a. If LLM omitted phone on first lookup, recover digits from last user transcript (STT)
+        if not customer_confirmed:
+            cand = _canonical_mobile_last10(effective_phone)
+            if not cand and self._latest_user_text:
+                cand = _canonical_mobile_last10(self._latest_user_text)
+                if cand:
+                    effective_phone = cand
+                    print(
+                        f"[Worker] Using phone from user transcript tail=…{cand[-4:]} "
+                        "(tool args omitted phone_number)"
+                    )
+            elif cand:
+                effective_phone = cand
+
+        # 1b. Validate phone — need at least 10 digits total; normalize to last 10 (India +91 / leading 0)
+        if not customer_confirmed:
+            final = _canonical_mobile_last10(effective_phone)
+            if not final:
+                digits_ct = len(_digits_only(effective_phone))
                 return {
                     "ok": False,
                     "reason": "invalid_phone",
                     "message": (
-                        f"The number provided has {len(digits_only)} digits, not 10. "
-                        "Ask the caller to repeat their 10-digit mobile number clearly."
+                        f"The number has {digits_ct} digits; need at least 10 for a mobile. "
+                        "Ask the caller to repeat their 10-digit number clearly, or call the tool "
+                        "with phone_number set to what they said."
                     ),
                 }
+            effective_phone = final
+
+        # 1c. Safety: if the model forgot to set customer_confirmed=true after user said their name,
+        # auto-promote this turn to confirmation based on name-like speech.
+        if not customer_confirmed and self._pending_customer and not (external_order_id or "").strip():
+            snippet_candidate = self._snippet_for_name_match(caller_spoken_name, raw_arguments)
+            if (
+                snippet_candidate
+                and not self._looks_like_phone_number_only(snippet_candidate)
+                and not re.search(r"\d", snippet_candidate)
+            ):
+                if self._spoken_name_tokens(snippet_candidate):
+                    customer_confirmed = True
+                    print(
+                        f"[Worker] Auto-promoted to customer_confirmed=True using snippet={snippet_candidate!r}"
+                    )
 
         # 2. ALWAYS call the DB first — this populates _pending_customer on the first call
+        t_db = time.perf_counter()
         result = await ORDER_LOOKUP.get_order_status(
             phone_number=effective_phone,
             customer_confirmed=customer_confirmed,
             external_order_id=external_order_id,
+        )
+        print(
+            f"[TIMING] tool get_order_status_from_db (DB+logic) {_ms_since(t_db):.0f}ms "
+            f"reason={result.get('reason')!r} ok={result.get('ok')}"
         )
 
         # 3. Store session state from the DB result BEFORE any guard check or return
@@ -737,6 +1163,18 @@ class OrderSupportAgent(Agent):
             self._pending_phone = None
             self._pending_customer = None
 
+        # 3b. Safety bootstrap: if caller already confirmed name but pending_customer was lost,
+        # recover from current confirmation_required payload so guard can proceed deterministically.
+        if (
+            customer_confirmed
+            and not self._pending_customer
+            and result.get("reason") == "confirmation_required"
+            and result.get("customer")
+        ):
+            self._pending_customer = result.get("customer")
+            self._pending_phone = ORDER_LOOKUP.normalize_phone(effective_phone) or self._pending_phone
+            print("[Worker] Recovered pending customer from confirmation_required payload")
+
         # 4. Name-confirmation guard — strict name validation when customer_confirmed=True
         if customer_confirmed and self._pending_customer:
             picking_order = bool((external_order_id or "").strip())
@@ -746,10 +1184,20 @@ class OrderSupportAgent(Agent):
                     == ORDER_LOOKUP.normalize_phone(self._pending_phone)
                 )
                 customer_name = (self._pending_customer or {}).get("name", "")
-                
-                # Strict name matching - check if spoken name matches database name
-                is_name_match = self._is_name_match(self._latest_user_text, customer_name)
-                
+                snippet = self._snippet_for_name_match(caller_spoken_name, raw_arguments)
+                is_name_match = self._is_name_match(snippet, customer_name) if snippet else False
+                if not snippet:
+                    print(
+                        "[Worker] name guard: empty name snippet — pass caller_spoken_name from the "
+                        f"user's last utterance. latest_user_text={self._latest_user_text!r} "
+                        f"caller_spoken_name={caller_spoken_name!r}"
+                    )
+                else:
+                    print(
+                        f"[Worker] name guard: snippet={snippet!r} db_name={customer_name!r} "
+                        f"tokens={self._spoken_name_tokens(snippet)!r} match={is_name_match}"
+                    )
+
                 if not same_phone or not is_name_match:
                     return {
                         "ok": False,
@@ -769,24 +1217,107 @@ class OrderSupportAgent(Agent):
                     result["confirmation_message"] = f"Thank you! Name confirmed. Here are your order details:"
                     return result
                 else:
-                    # Database didn't return orders yet, but name is confirmed - retry the call
-                    print(f"[Worker] Name confirmed: {customer_name}, retrying database call")
+                    # Name matched, but initial result was not final (often confirmation_required).
+                    # Force a confirmed DB fetch so we don't loop and the LLM doesn't hallucinate IDs.
+                    print(
+                        f"[Worker] Name confirmed: {customer_name}, forcing confirmed DB fetch "
+                        f"(initial reason={result.get('reason')!r})"
+                    )
+                    t_db2 = time.perf_counter()
                     retry_result = await ORDER_LOOKUP.get_order_status(
                         phone_number=effective_phone,
                         customer_confirmed=True,
                         external_order_id=external_order_id,
                     )
-                    if retry_result.get("ok"):
+                    print(
+                        f"[TIMING] tool get_order_status retry {_ms_since(t_db2):.0f}ms "
+                        f"reason={retry_result.get('reason')!r} ok={retry_result.get('ok')}"
+                    )
+                    # If backend still asks confirmation, convert to explicit error to prevent endless loop.
+                    if retry_result.get("reason") == "confirmation_required":
+                        return {
+                            "ok": False,
+                            "reason": "db_error",
+                            "phone_last10": ORDER_LOOKUP.normalize_phone(effective_phone),
+                            "customer": self._pending_customer,
+                            "message": (
+                                "Identity was matched, but backend did not progress to orders. "
+                                "Please try again in a moment."
+                            ),
+                        }
+
+                    if retry_result.get("ok") or retry_result.get("reason") == "order_selection_required":
                         retry_result["name_confirmed"] = True
                         retry_result["confirmation_message"] = f"Thank you! Name confirmed. Here are your order details:"
                     return retry_result
 
+        # 4b. If user asked with customer_confirmed=true and backend still asks for confirmation,
+        # stop here with explicit error to prevent LLM from inventing order IDs/status.
+        if customer_confirmed and result.get("reason") == "confirmation_required":
+            return {
+                "ok": False,
+                "reason": "db_error",
+                "phone_last10": ORDER_LOOKUP.normalize_phone(effective_phone),
+                "customer": self._pending_customer or result.get("customer"),
+                "message": (
+                    "Name confirmation did not progress to orders. "
+                    "Ask the caller to repeat their name once and retry."
+                ),
+            }
+
         # 5. Publish active order IDs to UI when selection is required
         if result.get("reason") == "order_selection_required":
+            active_orders = result.get("active_orders") or []
+            order_ids = [
+                str((row or {}).get("external_order_id") or "").strip().upper()
+                for row in active_orders
+                if isinstance(row, dict)
+            ]
+            current_list_sig = "|".join([oid for oid in order_ids if oid])
+            if current_list_sig and current_list_sig == self._last_active_orders_signature:
+                return {
+                    "ok": False,
+                    "reason": "order_selection_already_shared",
+                    "already_shared": True,
+                    "phone_last10": ORDER_LOOKUP.normalize_phone(effective_phone),
+                    "customer": result.get("customer") or self._pending_customer,
+                    "active_orders": active_orders,
+                    "message": (
+                        "Order options were already shared. Do not repeat the same list again. "
+                        "Ask the caller to say one order ID from the shown list."
+                    ),
+                }
+            self._last_active_orders_signature = current_list_sig
             await publish_active_order_ids_to_ui(
-                result.get("active_orders") or [],
+                active_orders,
                 "These are the external order IDs from your app (not internal order numbers). Tap or say the one you want.",
             )
+
+        # 6. De-duplicate repeated status narration for same order+status payload.
+        if result.get("ok"):
+            order_id = str(((result.get("order") or {}) if isinstance(result.get("order"), dict) else {}).get("external_order_id") or "").strip().upper()
+            latest_status = str(((result.get("latest_status") or {}) if isinstance(result.get("latest_status"), dict) else {}).get("status") or "").strip().lower()
+            phone_tail = str(ORDER_LOOKUP.normalize_phone(effective_phone) or "")
+            current_status_sig = f"{phone_tail}|{order_id}|{latest_status}"
+            if (
+                order_id
+                and latest_status
+                and current_status_sig == self._last_order_status_signature
+            ):
+                return {
+                    "ok": False,
+                    "reason": "order_status_already_shared",
+                    "already_shared": True,
+                    "phone_last10": phone_tail,
+                    "customer": result.get("customer") or self._pending_customer,
+                    "order": result.get("order"),
+                    "latest_status": result.get("latest_status"),
+                    "message": (
+                        "This order status was already shared in the previous response. "
+                        "Do not repeat it; ask what the caller wants next."
+                    ),
+                }
+            self._last_order_status_signature = current_status_sig
 
         return result
 
@@ -799,25 +1330,17 @@ async def entrypoint(ctx: JobContext):
     lang = participant.metadata if participant.metadata else "en-IN"
 
     print(f"[Worker] Incoming call. Detected language: {lang}")
-    print(f"[Worker] Using Groq model={GROQ_MODEL!r}")
 
     # aec_warmup_duration=0: default 3s blocks echo-cancellation warmup from treating user audio as
     # interrupt; combined with interruptible greeting, avoids dropped user turns (no reply after phone).
     # discard_audio_if_uninterruptible=False: keep mic audio for STT even if a speech handle is briefly non-interruptible.
-    # VAD settings optimized for primary speaker focus and background noise rejection:
-    # - min_silence_duration=1.0: Longer silence required to end speech (filters brief background sounds)
-    # - min_speech_duration=0.3: Slightly longer speech required to start (filters short background noises)
-    # - activation_threshold=0.6: Higher threshold to activate (more confident it's actual speech, not noise)
-    # - deactivation_threshold=0.3: Lower threshold to deactivate (quicker to stop when speech ends)
+    # VAD: env-tunable (VAD_*). Stricter activation rejects more side-talk / noise; raise further in loud spaces.
     agent_session = AgentSession(
         vad=_VAD_MODEL,
         stt=SarvamSTT(language=lang),
-        llm=groq.LLM(
-            model=GROQ_MODEL,
-            api_key=GROQ_API_KEY,
-        ),
+        llm=_build_llm(),
         tts=SarvamTTS(language=lang),
-        max_tool_steps=8,
+        max_tool_steps=4,
         aec_warmup_duration=0,
         discard_audio_if_uninterruptible=False,
         conn_options=SessionConnectOptions(
