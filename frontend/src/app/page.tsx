@@ -453,13 +453,26 @@ export default function Home() {
         body: JSON.stringify({ language_code: selectedLanguage.code }),
       });
 
-      const data = await res.json();
+      const raw = await res.text();
+      let data: { detail?: string; livekit_url?: string; livekit_token?: string };
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        throw new Error(
+          "Backend did not return JSON (tunnel down or wrong URL). Keep the API ngrok running and check NEXT_PUBLIC_BACKEND_URL.",
+        );
+      }
       if (!res.ok) {
         throw new Error(data.detail || "Failed to initiate call");
       }
 
-      setServerUrl(data.livekit_url);
-      setToken(data.livekit_token);
+      const livekitUrl = data.livekit_url?.trim();
+      const livekitToken = data.livekit_token?.trim();
+      if (!livekitUrl || !livekitToken) {
+        throw new Error("Backend response missing LiveKit URL or token");
+      }
+      setServerUrl(livekitUrl);
+      setToken(livekitToken);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Failed to connect to backend proxy";
       setErrorMsg(message);
