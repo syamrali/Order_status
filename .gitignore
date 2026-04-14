@@ -1,0 +1,16 @@
+# API keys & local environment (never commit)
+.env
+.env.*
+!.env.example
+
+# Encrypted env or secret files (if you use .enc for keys)
+*.enc
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# OS
+.DS_Store
+Thumbs.db
